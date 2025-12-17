@@ -57,6 +57,64 @@ class Node:
             self.children = (Node(left_rect), Node(right_rect))
 
 
+# Potentially make rects in each node smaller.
+# Each of the 4 sides of every rect has a 50% chance of being
+# moved ~10-20% towards the center, shrinking the rectangle randomly
+def shrink_nodes(root: Node, shrink_chance: float = 0.7):
+    r = root.rect
+    percent = 0.2
+
+    # Each side has 50% chance of shrinking by ~10-20% toward center
+    # Left side: move right
+    if random.random() < shrink_chance:
+        shrink = int(nrand(percent, 0.05, 0.15) * r.w)
+        r.x += shrink
+        r.w -= shrink
+
+    # Right side: move left
+    if random.random() < shrink_chance:
+        shrink = int(nrand(percent, 0.05, 0.15) * r.w)
+        r.w -= shrink
+
+    # Top side: move down
+    if random.random() < shrink_chance:
+        shrink = int(nrand(percent, 0.05, 0.15) * r.h)
+        r.y += shrink
+        r.h -= shrink
+
+    # Bottom side: move up
+    if random.random() < shrink_chance:
+        shrink = int(nrand(percent, 0.05, 0.15) * r.h)
+        r.h -= shrink
+
+    # Recursively process children
+    if root.children:
+        shrink_nodes(root.children[0], shrink_chance)
+        shrink_nodes(root.children[1], shrink_chance)
+
+
+# Connect all nodes in 'root' by drawing tunnels (the number 1) into the
+# 'area' array
+#
+# The 'split edge' of a rectangle is the edge closest to the split line.
+# The goal is to draw blocks so that the edges connect.
+#
+# For every leaf parent (parent with 2 leaf children):
+#
+# * If leaves still touch, do nothing
+# * If there at least 4 lines of empty space between leaves: Draw a tunnel
+#   from a random positions on the two split edges
+# * If 1-3 lines of empty space:
+#    - If you can draw a straight line somewhere from split edge 1 to split edge 2,
+#      draw that tunnel
+#    - Otherwise a tunnel from one split edge, across the split line and then turn
+#      90 degrees to join the other rectangle on the closest edge perpendicular to
+#      the split edge.
+def connect_rooms(root: Node, area: MutableSequence[int], width: int):
+    height = len(area) / width
+    pass
+
+
 # Generate a BSP (K-D) tree. Start with the given size, and create child
 # nodes using split() until a node has a width or height that is smaller than min_size
 # (If a any child of a node is too small, abondon the split and keep the node as a leaf)
@@ -104,10 +162,10 @@ def print_bsp(node: Node):
     leaves: list[Node] = []
     get_leaves(node, leaves)
 
-    # Create a grid
+    # Create a grid with background character to show empty space
     max_x = node.rect.x + node.rect.w
     max_y = node.rect.y + node.rect.h
-    grid = [[" " for _ in range(max_x)] for _ in range(max_y)]
+    grid = [["." for _ in range(max_x)] for _ in range(max_y)]
 
     # Characters to use for different nodes
     chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz@#$%&*+=?"
@@ -120,20 +178,23 @@ def print_bsp(node: Node):
         # Fill the rectangle with the character
         for y in range(r.y, r.y + r.h):
             for x in range(r.x, r.x + r.w):
-                grid[y][x] = char
+                if 0 <= y < max_y and 0 <= x < max_x:
+                    grid[y][x] = char
 
         # Draw borders for clarity
         for x in range(r.x, r.x + r.w):
-            if r.y > 0:
-                grid[r.y][x] = "-"
-            if r.y + r.h < max_y:
-                grid[r.y + r.h - 1][x] = "-"
+            if 0 <= x < max_x:
+                if r.y > 0 and r.y < max_y:
+                    grid[r.y][x] = "-"
+                if r.y + r.h - 1 >= 0 and r.y + r.h - 1 < max_y:
+                    grid[r.y + r.h - 1][x] = "-"
 
         for y in range(r.y, r.y + r.h):
-            if r.x > 0:
-                grid[y][r.x] = "|"
-            if r.x + r.w < max_x:
-                grid[y][r.x + r.w - 1] = "|"
+            if 0 <= y < max_y:
+                if r.x > 0 and r.x < max_x:
+                    grid[y][r.x] = "|"
+                if r.x + r.w - 1 >= 0 and r.x + r.w - 1 < max_x:
+                    grid[y][r.x + r.w - 1] = "|"
 
     # Print the grid
     for row in grid:
@@ -146,6 +207,7 @@ def test_bsp():
 
     root_rect = Rect(0, 0, 120, 50)
     tree = generate_tree(root_rect, min_size=6)
+    shrink_nodes(tree)
 
     print_bsp(tree)
 
