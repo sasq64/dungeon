@@ -2,6 +2,8 @@ from pathlib import Path
 
 import pixpy as pix
 
+import generate
+
 screen = pix.open_display(size=(1280, 1024))
 
 sprite_path = Path("gfx/Characters")
@@ -20,10 +22,35 @@ frame = 0
 pos = pix.Float2(100, 100)
 target = pos
 
-#con.set_tiles([ord('#')] * 128 * 128)
+# con.set_tiles([ord('#')] * 128 * 128)
+
+root_rect = generate.Rect(0, 0, 128, 128)
+tree = generate.generate_tree(root_rect, min_size=6)
+generate.shrink_nodes(tree)
+
+
+# Get all leaf nodes
+def get_leaves(n: generate.Node, leaves: list[generate.Node]):
+    if n.children is None:
+        leaves.append(n)
+    else:
+        get_leaves(n.children[0], leaves)
+        get_leaves(n.children[1], leaves)
+
+
+leaves: list[generate.Node] = []
+get_leaves(tree, leaves)
 
 for p in con.grid_size.grid_coordinates():
-    con.put(p, 1024 + 3*32)
+    con.put(p, 0x20)
+for leave in leaves:
+    r = leave.rect
+    for y in range(r.h):
+        for x in range(r.w):
+            con.put((x + r.x, y + r.y), 1024 + 3 * 32)
+
+# for p in con.grid_size.grid_coordinates():
+#    con.put(p, 1024 + 3 * 32)
 
 ## Movement rules:
 ## target = target square
@@ -35,8 +62,8 @@ next_time = screen.seconds + interval
 delta = pix.Float2.ZERO
 
 while pix.run_loop():
-    screen.clear(0xff0000ff)
-    screen.draw(con, size=con.size * 2)
+    screen.clear(0xFF0000FF)
+    screen.draw(con, size=con.size / 2)
 
     time = screen.seconds
     tick = False
@@ -46,7 +73,7 @@ while pix.run_loop():
         next_time = time + interval
 
     sprite = sprites[int(frame) % 8]
-    screen.draw(image=sprite, top_left=pos + (8,2), size=sprite.size * 2)
+    screen.draw(image=sprite, top_left=pos + (8, 2), size=sprite.size * 2)
 
     if tick:
         if pix.is_pressed(pix.key.LEFT):
@@ -64,4 +91,3 @@ while pix.run_loop():
     frame = (pos.x / 10) % 8
 
     screen.swap()
-
