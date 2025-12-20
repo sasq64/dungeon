@@ -1,7 +1,16 @@
-from collections.abc import MutableSequence
+from collections.abc import MutableSequence, MutableSet, Sequence, Set
 from dataclasses import dataclass
+import itertools
+import math
 import random
 import time
+import array
+import copy
+from tkinter import CENTER
+from typing import Final, override
+import pixpy as pix
+
+Int2 = pix.Int2
 
 FLOOR: int = 0
 WALL: int = 1
@@ -20,6 +29,92 @@ def nrand(avg: float, var: float, limit: float = 0.5):
     return min(max(random.gauss(avg, var), avg - limit), avg + limit)
 
 
+def intervals_overlap_strict(a0: int, a1: int, b0: int, b1: int) -> bool:
+    # positive-length overlap (not just a point)
+    return min(a1, b1) > max(a0, b0)
+
+
+TOP = 0
+RIGHT = 1
+BOTTOM = 2
+LEFT = 3
+
+NAMES = ["TOP", "RIGHT", "BOTTOM", "LEFT"]
+
+DELTAS = [Int2(1, 0), Int2(0, 1), Int2(-1, 0), Int2(0, -1)]
+
+
+@dataclass
+class Edge:
+    pos: Int2
+    l: int
+    dir: int
+
+    @property
+    def delta(self) -> Int2:
+        return DELTAS[self.dir]
+
+    @property
+    def mid(self) -> Int2:
+        return self.pos + self.delta * (self.l // 2)
+
+    @property
+    def endp(self) -> Int2:
+        return self.pos + self.delta * self.l
+
+    @property
+    def norm(self) -> Int2:
+        return DELTAS[(self.dir - 1) & 3]
+
+    @property
+    def is_horiz(self) -> bool:
+        return self.dir == TOP or self.dir == BOTTOM
+
+    @property
+    def is_vert(self) -> bool:
+        return self.dir == LEFT or self.dir == RIGHT
+
+    @override
+    def __repr__(self):
+        n = NAMES[self.dir]
+        return f"{n} : {self.pos} -> {self.endp}"
+
+    def shrink(self, delta: int) -> "Edge":
+        return Edge(self.pos + self.delta * delta, self.l - delta * 2, self.dir)
+
+
+def project(a: Edge, b: Edge) -> Edge | None:
+    if a.dir == b.dir:
+        return None
+    if a.is_horiz and b.is_horiz:
+        if a.dir == TOP:
+            s = max(a.pos.x, b.endp.x)
+            e = min(a.endp.x, b.pos.x)
+        else:
+            s = min(a.pos.x, b.endp.x)
+            e = max(a.endp.x, b.pos.x)
+        print(f"{s} {e}")
+        if e > s and a.dir == TOP:
+            return Edge(Int2(s, a.pos.y), e - s, a.dir)
+        if e < s and a.dir == BOTTOM:
+            return Edge(Int2(s, a.pos.y), s - e, a.dir)
+        return None
+    if a.is_vert and b.is_vert:
+        if a.dir == RIGHT:
+            s = max(a.pos.y, b.endp.y)
+            e = min(a.endp.y, b.pos.y)
+        else:
+            s = min(a.pos.y, b.endp.y)
+            e = max(a.endp.y, b.pos.y)
+        print(f"{s} {e}")
+        if e > s and a.dir == RIGHT:
+            return Edge(Int2(a.pos.x, s), e - s, a.dir)
+        elif e < s and a.dir == LEFT:
+            return Edge(Int2(a.pos.x, s), s - e, a.dir)
+        return None
+    return None
+
+
 @dataclass
 class Rect:
     x: int
@@ -27,9 +122,70 @@ class Rect:
     w: int
     h: int
 
+    @property
+    def xy(self) -> Int2:
+        return Int2(self.x, self.y)
+
+    def edge(self, dir: int) -> Edge:
+        if dir == TOP:
+            return Edge(self.xy, self.w, dir)
+        elif dir == RIGHT:
+            return Edge(self.xy + (self.w - 1, 0), self.h, dir)
+        elif dir == BOTTOM:
+            return Edge(self.xy + (self.w - 1, self.h - 1), self.w, dir)
+        else:
+            return Edge(self.xy + (0, self.h - 1), self.h, dir)
+
+    @property
+    def center(self) -> Int2:
+        return Int2(self.x + self.w // 2, self.y + self.h // 2)
+
+    @property
+    def bottom(self) -> Int2:
+        return Int2(self.x + self.w / 2, self.y + self.h)
+
+    @property
+    def top(self) -> Int2:
+        return Int2(self.x + self.w / 2, self.y)
+
+    @property
+    def left(self) -> Int2:
+        return Int2(self.x, self.y + self.h / 2)
+
+    @property
+    def right(self) -> Int2:
+        return Int2(self.x + self.w, self.y + self.h / 2)
+
+    @property
+    def x1(self) -> int:
+        return self.x + self.w
+
+    @property
+    def y1(self) -> int:
+        return self.y + self.h
+
+    def touches_along_edge(self, b: "Rect") -> bool:
+        # Vertical edge touch
+        if self.x1 == b.x or self.x == b.x1:
+            return intervals_overlap_strict(self.y, self.y1, b.y, b.y1)
+
+        # Horizontal edge touch
+        if self.y == b.y1 or self.y1 == b.y:
+            return intervals_overlap_strict(self.x, self.x1, b.x, b.x1)
+
+        return False
+
 
 HORIZ: int = 1
 VERT: int = 2
+
+
+def dist(a: Int2, b: Int2) -> int:
+    return abs(a.x - b.x) + abs(a.y - b.y)
+
+
+def distr(a: Int2, b: Int2) -> int:
+    return int(math.hypot(a.x - b.x, a.y - b.y))
 
 
 class Node:
@@ -57,100 +213,31 @@ class Node:
             self.children = (Node(left_rect), Node(right_rect))
 
 
-# Potentially make rects in each node smaller.
-# Each of the 4 sides of every rect has a 50% chance of being
-# moved ~10-20% towards the center, shrinking the rectangle randomly
-def shrink_nodes(root: Node, shrink_chance: float = 0.7):
-    r = root.rect
-    percent = 0.2
-
-    # Each side has 50% chance of shrinking by ~10-20% toward center
-    # Left side: move right
-    if random.random() < shrink_chance:
-        shrink = int(nrand(percent, 0.05, 0.15) * r.w)
-        r.x += shrink
-        r.w -= shrink
-
-    # Right side: move left
-    if random.random() < shrink_chance:
-        shrink = int(nrand(percent, 0.05, 0.15) * r.w)
-        r.w -= shrink
-
-    # Top side: move down
-    if random.random() < shrink_chance:
-        shrink = int(nrand(percent, 0.05, 0.15) * r.h)
-        r.y += shrink
-        r.h -= shrink
-
-    # Bottom side: move up
-    if random.random() < shrink_chance:
-        shrink = int(nrand(percent, 0.05, 0.15) * r.h)
-        r.h -= shrink
-
-    # Recursively process children
-    if root.children:
-        shrink_nodes(root.children[0], shrink_chance)
-        shrink_nodes(root.children[1], shrink_chance)
-
-
-# Connect all nodes in 'root' by drawing tunnels (the number 1) into the
-# 'area' array
-#
-# The 'split edge' of a rectangle is the edge closest to the split line.
-# The goal is to draw blocks so that the edges connect.
-#
-# For every leaf parent (parent with 2 leaf children):
-#
-# * If leaves still touch, do nothing
-# * If there at least 4 lines of empty space between leaves: Draw a tunnel
-#   from a random positions on the two split edges
-# * If 1-3 lines of empty space:
-#    - If you can draw a straight line somewhere from split edge 1 to split edge 2,
-#      draw that tunnel
-#    - Otherwise a tunnel from one split edge, across the split line and then turn
-#      90 degrees to join the other rectangle on the closest edge perpendicular to
-#      the split edge.
-def connect_rooms(root: Node, area: MutableSequence[int], width: int):
-    height = len(area) / width
-    pass
-
-
 # Generate a BSP (K-D) tree. Start with the given size, and create child
 # nodes using split() until a node has a width or height that is smaller than min_size
 # (If a any child of a node is too small, abondon the split and keep the node as a leaf)
 def generate_tree(root: Rect, min_size: int) -> Node:
     node = Node(root)
 
-    # Check if this node is large enough to split
-    if root.w >= min_size * 2 and root.h >= min_size * 2:
-        # Split the node
-        node.split()
-
-        # Recursively generate trees for the children
-        if node.children:
-            left_child, right_child = node.children
-            # Check if both children would be valid (not too small)
-            if (
-                left_child.rect.w >= min_size
-                and left_child.rect.h >= min_size
-                and right_child.rect.w >= min_size
-                and right_child.rect.h >= min_size
-            ):
-                # Valid split, recursively generate subtrees
-                node.children = (
-                    generate_tree(left_child.rect, min_size),
-                    generate_tree(right_child.rect, min_size),
-                )
-            else:
-                # Split would create invalid children, abandon it
-                node.children = None
-
+    node.split()
+    if node.children:
+        left_child, right_child = node.children
+        if (
+            left_child.rect.w >= min_size
+            and left_child.rect.h >= min_size
+            and right_child.rect.w >= min_size
+            and right_child.rect.h >= min_size
+        ):
+            node.children = (
+                generate_tree(left_child.rect, min_size),
+                generate_tree(right_child.rect, min_size),
+            )
+        else:
+            node.children = None
     return node
 
 
-def print_bsp(node: Node):
-    """Print a BSP tree by drawing rectangles with unique characters for each node."""
-
+def get_rects(root: Node) -> list[Rect]:
     # Get all leaf nodes
     def get_leaves(n: Node, leaves: list[Node]):
         if n.children is None:
@@ -160,67 +247,313 @@ def print_bsp(node: Node):
             get_leaves(n.children[1], leaves)
 
     leaves: list[Node] = []
-    get_leaves(node, leaves)
+    get_leaves(root, leaves)
 
-    # Create a grid with background character to show empty space
-    max_x = node.rect.x + node.rect.w
-    max_y = node.rect.y + node.rect.h
-    grid = [["." for _ in range(max_x)] for _ in range(max_y)]
+    return list([n.rect for n in leaves])
 
-    # Characters to use for different nodes
-    chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz@#$%&*+=?"
 
-    # Draw each leaf node
-    for i, leaf in enumerate(leaves):
-        char = chars[i % len(chars)]
-        r = leaf.rect
+@dataclass
+class Room:
+    rects: list[Rect]
+    connections: MutableSet[int]
 
-        # Fill the rectangle with the character
-        for y in range(r.y, r.y + r.h):
-            for x in range(r.x, r.x + r.w):
-                if 0 <= y < max_y and 0 <= x < max_x:
-                    grid[y][x] = char
+    def __init__(self, rect: Rect):
+        self.rects = [rect]
+        self.connections = set()
 
-        # Draw borders for clarity
-        for x in range(r.x, r.x + r.w):
-            if 0 <= x < max_x:
-                if r.y > 0 and r.y < max_y:
-                    grid[r.y][x] = "-"
-                if r.y + r.h - 1 >= 0 and r.y + r.h - 1 < max_y:
-                    grid[r.y + r.h - 1][x] = "-"
+    @property
+    def center(self) -> Int2:
+        return sum([r.center for r in self.rects], Int2.ZERO) // len(self.rects)
 
-        for y in range(r.y, r.y + r.h):
-            if 0 <= y < max_y:
-                if r.x > 0 and r.x < max_x:
-                    grid[y][r.x] = "|"
-                if r.x + r.w - 1 >= 0 and r.x + r.w - 1 < max_x:
-                    grid[y][r.x + r.w - 1] = "|"
 
-    # Print the grid
-    for row in grid:
-        print("".join(row))
+class Map:
+    def __init__(self, size: Int2):
+        self.rooms: list[Room] = []
+
+        self.width: Final = size.x
+        self.height: Final = size.y
+
+        root = Rect(0, 0, self.width, self.height)
+        node = generate_tree(root, 8)
+        self.rooms = list([Room(r) for r in get_rects(node)])
+        self.shrink_rooms()
+        self.tiles: Final = array.array("H", [0] * self.width * self.height)
+        self.merge_rooms()
+        self.draw_rooms()
+        self.build_graph()
+        self.join_rooms()
+
+    # Potentially make rects in each node smaller.
+    # Each of the 4 sides of every rect has a 50% chance of being
+    # moved ~10-20% towards the center, shrinking the rectangle randomly
+    def shrink_rooms(self, shrink_chance: float = 0.7):
+        percent = 0.25
+
+        for room in self.rooms:
+            r = room.rects[0]
+            # Each side has 50% chance of shrinking by ~10-20% toward center
+            # Left side: move right
+            if random.random() < shrink_chance:
+                shrink = int(nrand(percent, 0.05, 0.15) * r.w)
+                r.x += shrink
+                r.w -= shrink
+
+            # Right side: move left
+            if random.random() < shrink_chance:
+                shrink = int(nrand(percent, 0.05, 0.15) * r.w)
+                r.w -= shrink
+
+            # Top side: move down
+            if random.random() < shrink_chance:
+                shrink = int(nrand(percent, 0.05, 0.15) * r.h)
+                r.y += shrink
+                r.h -= shrink
+
+            # Bottom side: move up
+            if random.random() < shrink_chance:
+                shrink = int(nrand(percent, 0.05, 0.15) * r.h)
+                r.h -= shrink
+
+    def draw_rooms(self, offs: int = 10):
+        for i, room in enumerate(self.rooms):
+            for r in room.rects:
+                for y in range(r.h):
+                    for x in range(r.w):
+                        self.tiles[r.x + x + self.width * (r.y + y)] = i + offs
+
+    def plot(self, p: Int2, v: int):
+        self.tiles[p.x + p.y * self.width] = v
+
+    def draw_tunnel(self, frm: Int2, to: Int2, tile: int = 1):
+
+        dx = 1 if to.x > frm.x else -1
+        dy = 1 if to.y > frm.y else -1
+        p = frm
+        while p.x != to.x:
+            self.plot(p, tile)
+            p += (dx, 0)
+        while p.y != to.y:
+            self.plot(p, tile)
+            p += (0, dy)
+        self.plot(p, tile)
+
+    def horiz_draw(self, mid: Rect, to: Rect):
+        p = mid.center
+        while True:
+            self.plot(p, 1)
+
+    def ldraw(self, a: Edge, b: Edge):
+        p = a.mid
+        end = b.mid
+        print(f"###################### FROM {p} to {end}, {a.norm}, -{b.norm}")
+        return
+        while p.x != end.x and p.y != end.y:
+            self.plot(p, 1)
+            p += a.norm
+            # print(p)
+        while end != p:
+            self.plot(p, 1)
+            p -= b.norm
+            # print(p)
+
+    def sdraw(self, a: Edge, b: Edge) -> bool:
+        proj = project(e0, e1)
+        # Can we go from e0 -> e1
+        if proj and e0.pos.y > e1.pos.y:
+            p = proj.mid
+            tp = Int2(p.x, e1.pos.y)
+            while p != tp:
+                self.plot(p, 1)
+                p += proj.norm
+
+    def join_rects(self, a: Rect, b: Rect):
+
+        e0, e1 = a.edge(TOP), b.edge(BOTTOM)
+        proj = project(e0, e1)
+        # Can we go from e0 -> e1
+        if proj and e0.pos.y > e1.pos.y:
+            p = proj.mid
+            y = e1.pos.y
+            while p.y != y:
+                self.plot(p, 1)
+                p += proj.norm
+            return
+        e0, e1 = a.edge(LEFT), b.edge(RIGHT)
+        proj = project(e0, e1)
+        # Can we go from e0 -> e1
+        if proj and e0.pos.x > e1.pos.x:
+            p = proj.mid
+            x = e1.pos.x
+            while p.x != x:
+                self.plot(p, 1)
+                p += proj.norm
+                # p -= (1, 0)
+            return
+
+        dists: list[tuple[int, int, int]] = []
+        for i in range(4):
+            m = a.edge(i).mid
+            j = (i - 1) & 3
+            d = dist(m, b.edge(j).mid)
+            dists.append((d, i, j))
+            j = (i + 1) & 3
+            d = dist(m, b.edge(j).mid)
+            dists.append((d, i, j))
+
+        dists.sort()
+        print(dists)
+        _, i, j = dists[0]
+        print(f"JOIN EDGE {a.edge(i)} with {b.edge(j)}")
+        self.ldraw(a.edge(i), b.edge(j))
+
+    def join_rooms(self):
+        for i, room in enumerate(self.rooms):
+            for c in room.connections:
+                other = self.rooms[c]
+                d = [
+                    (dist(r.center, other.center), i) for i, r in enumerate(room.rects)
+                ]
+                d2 = sorted(d)
+                closest = room.rects[d2[0][1]]
+                e = [
+                    (dist(closest.center, r.center), i)
+                    for i, r in enumerate(other.rects)
+                ]
+                e2 = sorted(e)
+                closest2 = other.rects[e2[0][1]]
+                print(f"Room {i} : {closest} -> {c} : {closest2}")
+                self.join_rects(closest, closest2)
+
+    def merge_rooms(self):
+
+        for i, room in enumerate(self.rooms):
+            for j, room2 in enumerate(self.rooms):
+                if i == j or len(room2.rects) == 0:
+                    continue
+                for r1 in room.rects[:]:
+                    for r2 in room2.rects:
+                        if r1.touches_along_edge(r2):
+                            room.rects.extend(room2.rects)
+                            room2.rects = []
+                            break
+        self.rooms = list([room for room in self.rooms if len(room.rects) > 0])
+
+    def build_graph(self):
+        centers = [room.center for room in self.rooms]
+        K = 4  # neighbors per room (tunable)
+
+        candidate_edges: set[tuple[int, int, int]] = set()  # (i, j, weight)
+
+        for i, ci in enumerate(centers):
+            distances: list[tuple[int, int]] = []
+            for j, cj in enumerate(centers):
+                if i == j:
+                    continue
+                distances.append((dist(ci, cj), j))
+            distances.sort()
+            d = distances[0][0]
+            no = distances[0][1]
+            print(f"{len(distances)} ROOM #{i} closest {no} ({d} tiles)")
+            for _, j in distances[:K]:
+                a, b = sorted((i, j))
+                candidate_edges.add((a, b, dist(centers[a], centers[b])))
+
+        parent: list[int] = list(range(len(self.rooms)))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int):
+            ra = find(a)
+            rb = find(b)
+            if ra != rb:
+                parent[rb] = ra
+                return True
+            return False
+
+        edges_sorted = sorted(candidate_edges, key=lambda e: e[2])
+
+        # graph: dict[int, MutableSet[int]] = {i: set() for i in range(len(self.rooms))}
+        # mst_edges: list[tuple[int, int]] = []
+
+        for a, b, _ in edges_sorted:
+            if union(a, b):
+                self.rooms[a].connections.add(b)
+                self.rooms[b].connections.add(a)
+
+        EXTRA_CONNECTION_PROB = 0.20
+
+        # for a, b, _ in edges_sorted:
+        #     if b in self.rooms[a].connections:
+        #         continue  # already in MST
+        #
+        #     if random.random() < EXTRA_CONNECTION_PROB:
+        #         self.rooms[a].connections.add(b)
+        #         self.rooms[b].connections.add(a)
+
+    def add_extra_connections(self):
+        pass
+
+    def draw_tunnels(self):
+        used: MutableSet[int] = set()
+        for i, room0 in enumerate(self.rooms):
+            for c in room0.connections:
+                if c in used:
+                    continue
+                room1 = self.rooms[c]
+                self.draw_tunnel(room0.center, room1.center)
+            used.add(i)
+
+    def print(self):
+        chars = (
+            " ##3456789ABCDEFGHIJKLMNOPQRSTUVWXYabcdefghijklmnopqrstuvwxyz!@#$%&*+=?!"
+        )
+        c = [" ", "#", "."]
+
+        n = 0
+        for y in range(self.height):
+            s = "".join([chars[i] for i in self.tiles[n : n + self.width]])
+            print(s)
+            n += self.width
+
+
+def print_area(area: Sequence[int], width: int):
+    chars = (
+        " #ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz!@#$%&*+=?!"
+    )
+    c = [" ", "#", "."]
+    height = len(area) // width
+
+    n = 0
+    for y in range(height):
+        s = "".join([chars[i] for i in area[n : n + width]])
+        print(s)
+        n += width
 
 
 def test_bsp():
     """Test function that generates and prints a BSP tree."""
-    random.seed(None)
-
-    root_rect = Rect(0, 0, 120, 50)
-    tree = generate_tree(root_rect, min_size=6)
-    shrink_nodes(tree)
-
-    print_bsp(tree)
-
-    # Count leaves
-    def count_leaves(n: Node) -> int:
-        if n.children is None:
-            return 1
-        return count_leaves(n.children[0]) + count_leaves(n.children[1])
-
-    num_leaves = count_leaves(tree)
-    print()
-    print(f"Generated tree with {num_leaves} leaf nodes")
+    random.seed(1)
+    map = Map()
+    map.draw_tunnels()
+    map.print()
 
 
 if __name__ == "__main__":
-    test_bsp()
+    e0 = Edge(pix.Int2(1, 1), 10, TOP)
+    e1 = Edge(pix.Int2(8, 3), 5, BOTTOM)
+    print(project(e0, e1))
+    print(project(e1, e0))
+
+    e0 = Edge(pix.Int2(1, 1), 10, TOP)
+    e1 = Edge(pix.Int2(18, 3), 7, BOTTOM)
+    print(project(e0, e1))
+    print(project(e1, e0))
+
+    e0 = Edge(pix.Int2(10, 10), 50, RIGHT)
+    e1 = Edge(pix.Int2(100, 40), 12, LEFT)
+    print(project(e0, e1))
+    print(project(e1, e0))
