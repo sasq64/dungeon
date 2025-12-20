@@ -7,7 +7,7 @@ import time
 
 from generate import Map
 
-screen = pix.open_display(size=(1280, 1024))
+screen = pix.open_display(size=(1280, 1024), full_screen=True, id="dungeon")
 
 sprite_path = Path("gfx/Characters")
 sprites = pix.load_png(sprite_path / "Soldier/Soldier/Soldier-Walk.png").split(
@@ -80,7 +80,7 @@ while pix.run_loop():
     t = map.tiles[p.x + 128 * p.y] - 10
     con.cursor_pos = (0, 0)
     con.set_color(pix.color.WHITE, pix.color.RED)
-    con.write(f"X {p.x} Y {p.y}")
+    con.write(f"X {p.x:02} Y {p.y:02}  ")
     if t >= 0:
         room = map.rooms[t]
         for c in room.connections:
