@@ -68,6 +68,18 @@ class Edge:
             return other.dir == LEFT and other.pos.x > self.pos.x
         return False
 
+    def faces_point(self, other: Int2):
+        if self.dir == TOP:
+            return other.y < self.pos.y
+        if self.dir == BOTTOM:
+            return other.y > self.pos.y
+        if self.dir == LEFT:
+            return other.x < self.pos.x
+        if self.dir == RIGHT:
+            return other.x > self.pos.x
+        return False
+
+
     @override
     def __repr__(self):
         n = NAMES[self.dir]

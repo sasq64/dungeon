@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import MutableSet
+from collections.abc import MutableSet
 
 import pixpy as pix
 import random
@@ -27,20 +27,25 @@ target = pos
 
 # con.set_tiles([ord('#')] * 128 * 128)
 
-size = pix.Int2(128, 128)
+seed = time.time_ns()
+# seed = 1766258319115268000
+# seed = 1766260133058949000
+random.seed(seed)
+
+size = pix.Int2(120, 75)
 map = Map(size)
 
+print(seed)
 # map.join_rooms()
 
 for p in con.grid_size.grid_coordinates():
-    con.put(p, 0x20)
+    con.put(p, 1024 + 3 * 32)
 
 used: MutableSet[int] = set()
-for y in range(128):
-    for x in range(128):
-        t = map.tiles[x + 128 * y]
-        if t > 0:
-            con.put((x, y), 1024 + 3 * 32)
+for xy in size.grid_coordinates():
+    t = map.tiles[xy.x + size.x * xy.y]
+    if t > 0:
+        con.put(xy, 0x20)
 
 colors = [
     pix.color.WHITE,
@@ -68,16 +73,12 @@ interval = 0.2
 next_time = screen.seconds + interval
 delta = pix.Float2.ZERO
 
-seed = time.time_ns()
-random.seed(seed)
-print(seed)
-
 while pix.run_loop():
     screen.clear(0xFF0000FF)
     screen.draw(con, size=con.size)
 
     p = pix.get_pointer().toi() // tile_size.toi()
-    t = map.tiles[p.x + 128 * p.y] - 10
+    t = map.tiles[p.x + size.x * p.y] - 10
     con.cursor_pos = (0, 0)
     con.set_color(pix.color.WHITE, pix.color.RED)
     con.write(f"X {p.x:02} Y {p.y:02}  ")
