@@ -51,6 +51,37 @@ Separate time in separate rooms
 Straight co-op ? 
 
 
+MAP PARTITION
+
+Generate WxH map with rooms => One cell handled by one "server instance"
+
+Max number of players, must move in "lock step"
+
+All players visible on the map. Players not seeing monsters move on their own
+time.
+
+All monsters that are close enough together form a monster group.
+
+All players close enough to a group is part of that fight and share time
+
+Other players can move freely but as soon as they see a monster (not player) they
+join the fight
+
+(Baldurs Gate 3)
+
+Turn based Group:
+
+MOVE : no  TIME : t READY: n/m
+
+t ticks down from N seconds
+
+When player performs action (move etc) arrow is shown and n increases
+
+Optional: Time out (wait longer) or speed up (wait shorter) somehow voted
+(Easy fight, most players want to speed things up so we do)
+
+
+
 
 
 
