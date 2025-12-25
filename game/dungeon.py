@@ -28,7 +28,7 @@ target = pos
 # con.set_tiles([ord('#')] * 128 * 128)
 
 seed = time.time_ns()
-# seed = 1766258319115268000
+# seed = 1766348969638435230
 # seed = 1766260133058949000
 random.seed(seed)
 

@@ -1,0 +1,17 @@
+[project]
+name = "dungeon-game"
+version = "0.1.0"
+description = "A dungeon generation game"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "aioquic",
+    "pixpy",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["dungeon", "generate", "grid"]

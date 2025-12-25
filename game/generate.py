@@ -140,7 +140,7 @@ class Map:
     # Each of the 4 sides of every rect has a 50% chance of being
     # moved ~10-20% towards the center, shrinking the rectangle randomly
     def shrink_rooms(self, shrink_chance: float = 0.7):
-        percent = 0.25
+        percent = 0.15
 
         for room in self.rooms:
             r = room.rects[0]
@@ -198,7 +198,7 @@ class Map:
         return self.tiles[a.x + self.width * a.y] == 0
 
     def check_all(self, a: Int2, b: Int2, c: Int2) -> bool:
-        return self.check(a) and self.check(b) and self.check(c) 
+        return self.check(a) and self.check(b) and self.check(c)
 
     def ldraw(self, a: Edge, b: Edge) -> bool:
         a = a.shrink(1)
@@ -212,7 +212,7 @@ class Map:
         if not a.faces_point(cross) or not b.faces_point(cross):
             return False
 
-        points : list[Int2] = []
+        points: list[Int2] = []
         ap += a.norm
 
         while ap != cross:
@@ -240,9 +240,9 @@ class Map:
         if proj0 and proj1 and e0.faces(e1):
             p = proj0.mid
             print(f"FROM {p} to {e1} with {proj0.norm}")
-            points : list[Int2] = []
+            points: list[Int2] = []
             p += proj0.norm
-            while (p.x != e1.pos.x and p.y != e1.pos.y):
+            while p.x != e1.pos.x and p.y != e1.pos.y:
                 if not self.check_all(p, p + proj0.delta, p - proj0.delta):
                     return False
                 points.append(p)
@@ -277,7 +277,7 @@ class Map:
 
         dists.sort()
         print(dists)
-        for _,i,j in dists:
+        for _, i, j in dists:
             print(f"JOIN EDGE {a.edge(i)} with {b.edge(j)}")
             if self.ldraw(a.edge(i), b.edge(j)):
                 return True
@@ -287,28 +287,31 @@ class Map:
         connected: MutableSet[tuple[int, int]] = set()
         for i, room in enumerate(self.rooms):
             for c in room.connections:
-                if (c,i) in connected or (i,c) in connected:
+                if (c, i) in connected or (i, c) in connected:
                     continue
                 other = self.rooms[c]
 
-                distances0 = sorted([
-                    (dist(r.center, other.center), i) for i, r in enumerate(room.rects)
-                ])
+                distances0 = sorted(
+                    [
+                        (dist(r.center, other.center), i)
+                        for i, r in enumerate(room.rects)
+                    ]
+                )
                 for d in distances0:
                     closest = room.rects[d[1]]
-                    e = sorted([
-                        (dist(closest.center, r.center), i)
-                        for i, r in enumerate(other.rects)
-                    ])
+                    e = sorted(
+                        [
+                            (dist(closest.center, r.center), i)
+                            for i, r in enumerate(other.rects)
+                        ]
+                    )
                     closest2 = other.rects[e[0][1]]
                     print(f"Room {i} : {closest} -> {c} : {closest2}")
                     if self.join_rects(closest, closest2):
                         connected.add((i, c))
                         break
 
-
-    def merge_rooms(self):
-
+    def _merge_rooms(self):
         for i, room in enumerate(self.rooms):
             for j, room2 in enumerate(self.rooms):
                 if i == j or len(room2.rects) == 0:
@@ -318,7 +321,13 @@ class Map:
                         if r1.touches_along_edge(r2):
                             room.rects.extend(room2.rects)
                             room2.rects = []
-                            break
+                            return True
+        return False
+
+    def merge_rooms(self):
+        rc = True
+        while rc:
+            rc = self._merge_rooms()
         self.rooms = list([room for room in self.rooms if len(room.rects) > 0])
 
     def build_graph(self):
@@ -368,7 +377,7 @@ class Map:
                 self.rooms[b].connections.add(a)
 
         EXTRA_CONNECTION_PROB = 0.20
-        
+
         for a, b, _ in edges_sorted:
             if b in self.rooms[a].connections:
                 continue  # already in MST
