@@ -81,8 +81,16 @@ Optional: Time out (wait longer) or speed up (wait shorter) somehow voted
 (Easy fight, most players want to speed things up so we do)
 
 
+## PROTOCOL
 
+Server: open bi, send FRAME #x
 
+CLIENT CMD
+
+MOVE, d
+GOTO x,y
+ATTACK id
+OPEN d
 
 
 
