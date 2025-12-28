@@ -1,4 +1,7 @@
 use anyhow::Result;
+use num_enum::FromPrimitive;
+use num_enum::IntoPrimitive;
+use num_enum::TryFromPrimitive;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -7,7 +10,7 @@ use rustls_pemfile::{certs, private_key};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -17,7 +20,10 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::watch;
-use tokio::time::timeout;
+use tokio::time::{Instant, sleep_until, timeout};
+
+#[macro_use]
+extern crate num_derive;
 
 fn load_certs(path: &Path) -> Vec<CertificateDer<'static>> {
     let mut reader = BufReader::new(File::open(path).unwrap());
@@ -83,8 +89,8 @@ pub fn make_client_endpoint(bind_addr: SocketAddr) -> Result<Endpoint> {
     Ok(endpoint)
 }
 
-/// Constructs a QUIC endpoint configured to listen for incoming connections on a certain address
-/// and port.
+/// Constructs a QUIC endpoint configured to listen for incoming connections
+/// on a certain address and port.
 ///
 /// ## Returns
 ///
@@ -106,10 +112,12 @@ struct Msg {
     enabled: bool,
 }
 
+#[repr(u8)]
+#[derive(IntoPrimitive, TryFromPrimitive)]
 enum NetCmd {
     YouAre = 1,
     Turn = 2,
-    MoveTo,
+    MoveTo = 3,
 }
 
 type Dir = u8;
@@ -181,7 +189,11 @@ async fn main() -> Result<()> {
                 while turn_rx.changed().await.is_ok() {
                     let (turn, data) = turn_rx.borrow_and_update().clone();
                     if !data.is_empty() {
-                        send_stream.write(&data).await.unwrap();
+                        let res = send_stream.write(&data).await;
+                        if let Err(e) = res {
+                            cmd_tx.send((id, Command::TimeoutPlayer)).await.unwrap();
+                            break;
+                        }
                     }
                     println!("Player {id} turn {turn}");
                     // let bytes = rmp_serde::to_vec(&msg).unwrap();
@@ -189,9 +201,30 @@ async fn main() -> Result<()> {
                     if let Ok(res) =
                         timeout(Duration::from_secs(1), recv_stream.read(&mut target)).await
                     {
-                        let res = res.unwrap();
-                        if let Some(count) = res {
-                            println!("Read {count} bytes");
+                        match res {
+                            Ok(count) => {
+                                if let Some(count) = count {
+                                    println!("Read {:x?}", &target[0..count]);
+                                    let mut cursor = Cursor::new(&target[0..count]);
+                                    let len = rmp::decode::read_array_len(&mut cursor).unwrap();
+                                    println!("Len {len}");
+                                    let cmd: u8 = rmp::decode::read_int(&mut cursor).unwrap();
+                                    println!("CMD {cmd}");
+                                    match NetCmd::try_from(cmd) {
+                                        Ok(NetCmd::MoveTo) => {
+                                            let x = rmp::decode::read_u32(&mut cursor).unwrap();
+                                            let y = rmp::decode::read_u32(&mut cursor).unwrap();
+                                        }
+                                        Ok(NetCmd::Turn) => {}
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("Error: {:?}", e);
+                                cmd_tx.send((id, Command::TimeoutPlayer)).await.unwrap();
+                                break;
+                            }
                         }
                     } else {
                         // Timeout
@@ -212,7 +245,10 @@ async fn main() -> Result<()> {
         let mut ids = HashSet::new();
         ids.insert(0);
         let mut buf = Vec::with_capacity(1024);
+        let mut t = Instant::now() + Duration::from_millis(1000);
         for turn in 1.. {
+            sleep_until(t).await;
+            t += Duration::from_millis(1000);
             println!("SRV: Turn {turn}");
             _ = rmp::encode::write_array_len(&mut buf, 2);
             _ = rmp::encode::write_u8(&mut buf, NetCmd::Turn as u8);
@@ -226,14 +262,18 @@ async fn main() -> Result<()> {
                     let mut s = state.lock().unwrap();
                     match cmd {
                         Command::AddPlayer => _ = s.players.insert(id, Player { x: 0, y: 0 }),
-                        Command::TimeoutPlayer => _ = s.players.remove(&id),
+                        Command::TimeoutPlayer => {
+                            _ = s.players.remove(&id);
+                            println!("Removed player {id}");
+                        }
+
                         Command::MoveTo(x, y) => {
                             let player = s.players.get_mut(&id).unwrap();
                             player.x = x as u32;
                             player.y = y as u32;
                             _ = rmp::encode::write_array_len(&mut buf, 2);
                             _ = rmp::encode::write_u8(&mut buf, NetCmd::MoveTo as u8);
-                            _ = rmp::encode::write_u64(&mut buf, turn as u64);
+                            _ = rmp::encode::write_u64(&mut buf, id);
                             _ = rmp::encode::write_u32(&mut buf, player.x);
                             _ = rmp::encode::write_u32(&mut buf, player.y);
                         }
@@ -261,7 +301,7 @@ async fn main() -> Result<()> {
     let mut target = vec![0; 128];
     if let Some(count) = r.read(&mut target).await? {
         println!("READ {count} {}", target[0]);
-        s.write(&target[0..1]).await?;
+        //s.write(&target[0..1]).await?;
     }
 
     // Make sure the server has a chance to clean up

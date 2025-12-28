@@ -1,13 +1,13 @@
 import asyncio
-from asyncio import StreamReader, StreamWriter
 import logging
 import ssl
-import msgpack
 import sys
+from asyncio import StreamReader, StreamWriter
 from pathlib import Path
+
+import msgpack
 from aioquic.asyncio.client import connect
 from aioquic.quic.configuration import QuicConfiguration
-
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -30,12 +30,13 @@ class Client:
                 for msg in unpacker:
                     if msg[0] == 2:
                         turn = msg[1]
-                        d2 = msgpack.packb([3])
+                        d2 = msgpack.packb([0])
+                        print("WRITE")
                         writer.write(d2)
                     print(msg)
             # Send a response back to the server
-            writer.write(b"Hello from Python client!")
-            writer.write_eof()
+            # writer.write(b"Hello from Python client!")
+            # writer.write_eof()
 
             logger.info("Response sent to server")
         except Exception as e:
