@@ -1,6 +1,7 @@
 use anyhow::Result;
 use num_enum::IntoPrimitive;
 use num_enum::TryFromPrimitive;
+use quinn::RecvStream;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
+use std::ptr::eq;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -111,6 +113,7 @@ struct Msg {
 #[repr(u8)]
 #[derive(IntoPrimitive, TryFromPrimitive)]
 enum NetCmd {
+    Pass = 0,
     YouAre = 1,
     Turn = 2,
     MoveTo = 3,
@@ -124,7 +127,7 @@ enum Command {
     AddPlayer,
     TimeoutPlayer,
     Move(Dir),
-    MoveTo(u8, u8),
+    MoveTo(u32, u32),
     Attack(RelPos),
 }
 
@@ -135,6 +138,15 @@ struct Player {
 
 struct GameState {
     players: HashMap<u64, Player>,
+}
+
+async fn read(recv_stream: &mut RecvStream, target: &mut [u8]) {
+    if let Ok(res) = timeout(Duration::from_secs(1), recv_stream.read_exact(target)).await {
+        match res {
+            Ok(_) => {}
+            Err(e) => {}
+        }
+    }
 }
 
 #[tokio::main]
@@ -194,42 +206,51 @@ async fn main() -> Result<()> {
                     println!("Player {id} turn {turn}");
                     // let bytes = rmp_serde::to_vec(&msg).unwrap();
                     // send_stream.write(&bytes).await.unwrap();
-                    if let Ok(res) =
-                        timeout(Duration::from_secs(1), recv_stream.read(&mut target)).await
-                    {
-                        match res {
-                            Ok(count) => {
-                                if let Some(count) = count {
-                                    println!("Read {:x?}", &target[0..count]);
-                                    let mut cursor = Cursor::new(&target[0..count]);
-                                    let len = rmp::decode::read_array_len(&mut cursor).unwrap();
-                                    println!("Len {len}");
-                                    let cmd: u8 = rmp::decode::read_int(&mut cursor).unwrap();
-                                    println!("CMD {cmd}");
-                                    match NetCmd::try_from(cmd) {
-                                        Ok(NetCmd::MoveTo) => {
-                                            let x = rmp::decode::read_u32(&mut cursor).unwrap();
-                                            let y = rmp::decode::read_u32(&mut cursor).unwrap();
+                    let mut command: Option<Command> = None;
+                    while command.is_none() {
+                        let _ = read(&mut recv_stream, &mut target[..4]).await;
+                        let len = u32::from_be_bytes(target[0..4].try_into().unwrap());
+                        if let Ok(res) =
+                            timeout(Duration::from_secs(1), recv_stream.read(&mut target)).await
+                        {
+                            match res {
+                                Ok(count) => {
+                                    if let Some(count) = count {
+                                        println!("Read {:x?}", &target[0..count]);
+                                        let mut cursor = Cursor::new(&target[0..count]);
+                                        let len = rmp::decode::read_array_len(&mut cursor).unwrap();
+                                        println!("Len {len}");
+                                        let cmd: u8 = rmp::decode::read_int(&mut cursor).unwrap();
+                                        println!("CMD {cmd}");
+                                        match NetCmd::try_from(cmd) {
+                                            Ok(NetCmd::MoveTo) => {
+                                                let x: u32 =
+                                                    rmp::decode::read_int(&mut cursor).unwrap();
+                                                let y: u32 =
+                                                    rmp::decode::read_int(&mut cursor).unwrap();
+                                                println!("Move To {x} {y}");
+                                                command = Some(Command::MoveTo(x, y));
+                                            }
+                                            Ok(NetCmd::Turn) => {}
+                                            _ => {}
                                         }
-                                        Ok(NetCmd::Turn) => {}
-                                        _ => {}
                                     }
                                 }
+                                Err(e) => {
+                                    println!("Error: {:?}", e);
+                                    command = Some(Command::TimeoutPlayer);
+                                }
                             }
-                            Err(e) => {
-                                println!("Error: {:?}", e);
-                                cmd_tx.send((id, Command::TimeoutPlayer)).await.unwrap();
-                                break;
-                            }
+                        } else {
+                            // Timeout
+                            println!("Timeout");
+                            command = Some(Command::TimeoutPlayer);
                         }
-                    } else {
-                        // Timeout
-                        println!("Timeout");
-                        cmd_tx.send((id, Command::TimeoutPlayer)).await.unwrap();
-                        break;
                     }
-                    println!("{id} send Wait");
-                    cmd_tx.send((id, Command::Wait)).await.unwrap();
+                    if let Some(command) = command {
+                        println!("{id} send Wait");
+                        cmd_tx.send((id, command)).await.unwrap();
+                    }
                 }
             });
         }
@@ -241,16 +262,20 @@ async fn main() -> Result<()> {
         let mut ids = HashSet::new();
         ids.insert(0);
         let mut buf = Vec::with_capacity(1024);
-        let mut t = Instant::now() + Duration::from_millis(1000);
-        for turn in 1.. {
-            sleep_until(t).await;
-            t += Duration::from_millis(1000);
-            println!("SRV: Turn {turn}");
-            _ = rmp::encode::write_array_len(&mut buf, 2);
-            _ = rmp::encode::write_u8(&mut buf, NetCmd::Turn as u8);
-            _ = rmp::encode::write_u64(&mut buf, turn as u64);
-            turn_tx.send((turn, buf.clone())).unwrap();
-            buf.clear();
+        let mut turn = 0;
+        loop {
+            if state.lock().unwrap().players.is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            } else {
+                println!("SRV: Turn {turn}");
+                _ = rmp::encode::write_array_len(&mut buf, 2);
+                _ = rmp::encode::write_u8(&mut buf, NetCmd::Turn as u8);
+                _ = rmp::encode::write_u64(&mut buf, turn as u64);
+                turn_tx.send((turn, buf.clone())).unwrap();
+                buf.clear();
+                turn += 1;
+            }
+            // Get all client commands
             loop {
                 let (id, cmd) = cmd_rx.recv().await.unwrap();
                 println!("SRV: {id} reported {:?}", cmd);
