@@ -1,5 +1,8 @@
+import asyncio
 from pathlib import Path
-from collections.abc import MutableSet
+from typing import Final
+
+# from collections.abc import MutableSet
 
 import pixpy as pix
 import random
@@ -7,111 +10,127 @@ import time
 
 from generate import Map
 
-screen = pix.open_display(size=(1280, 1024), full_screen=True, id="dungeon")
-
-sprite_path = Path("gfx/Characters")
-sprites = pix.load_png(sprite_path / "Soldier/Soldier/Soldier-Walk.png").split(
-    cols=8, rows=1
-)
-
-s = 32.0
-tile_size = pix.Float2(16, 16)
-
-tiles = pix.load_png("gfx/mono_tiles.png").split(size=tile_size)
-con = pix.Console(cols=128, rows=128, tile_size=tile_size)
-con.set_color(pix.color.GREEN, pix.color.DARK_GREY)
-con.set_tile_images(1024, tiles)
-frame = 0
-pos = pix.Float2(100, 100)
-target = pos
-
-# con.set_tiles([ord('#')] * 128 * 128)
-
-seed = time.time_ns()
-# seed = 1766348969638435230
-# seed = 1766260133058949000
-random.seed(seed)
-
-size = pix.Int2(120, 75)
-map = Map(size)
-
-print(seed)
-# map.join_rooms()
-
-for p in con.grid_size.grid_coordinates():
-    con.put(p, 1024 + 3 * 32)
-
-used: MutableSet[int] = set()
-for xy in size.grid_coordinates():
-    t = map.tiles[xy.x + size.x * xy.y]
-    if t > 0:
-        con.put(xy, 0x20)
-
-colors = [
-    pix.color.WHITE,
-    pix.color.LIGHT_BLUE,
-    pix.color.LIGHT_RED,
-    pix.color.LIGHT_GREY,
-    pix.color.ORANGE,
-]
-for t, room in enumerate(map.rooms):
-    for u, r in enumerate(room.rects):
-        con.set_color(colors[u % 5], pix.color.BLACK)
-        con.put((r.x, r.y), 0x30 + t // 10)
-        con.put((r.x + 1, r.y), 0x30 + t % 10)
+from client import Client
 
 
-# for p in con.grid_size.grid_coordinates():
-#    con.put(p, 1024 + 3 * 32)
+class Game:
+    def __init__(self, screen: pix.Canvas):
+        self.screen = screen
+        sprite_path = Path("gfx/Characters")
+        self.sprites = pix.load_png(
+            sprite_path / "Soldier/Soldier/Soldier-Walk.png"
+        ).split(cols=8, rows=1)
 
-## Movement rules:
-## target = target square
-## when moving
+        # s = 32.0
+        self.tile_size = pix.Float2(16, 16)
 
-interval = 0.2
+        self.tiles = pix.load_png("gfx/mono_tiles.png").split(size=self.tile_size)
+        self.con = pix.Console(cols=128, rows=128, tile_size=self.tile_size)
+        self.con.set_color(pix.color.GREEN, pix.color.DARK_GREY)
+        self.con.set_tile_images(1024, self.tiles)
+        self.frame = 0
+        self.pos = pix.Float2(100, 100)
+        self.target: pix.Float2 = self.pos
 
-next_time = screen.seconds + interval
-delta = pix.Float2.ZERO
+        # con.set_tiles([ord('#')] * 128 * 128)
 
-while pix.run_loop():
-    screen.clear(0xFF0000FF)
-    screen.draw(con, size=con.size)
+        self.seed = time.time_ns()
+        # seed = 1766348969638435230
+        # seed = 1766260133058949000
+        random.seed(self.seed)
 
-    p = pix.get_pointer().toi() // tile_size.toi()
-    t = map.tiles[p.x + size.x * p.y] - 10
-    con.cursor_pos = (0, 0)
-    con.set_color(pix.color.WHITE, pix.color.RED)
-    con.write(f"X {p.x:02} Y {p.y:02}  ")
-    if t >= 0:
-        room = map.rooms[t]
-        for c in room.connections:
-            r2 = map.rooms[c]
-            p0 = pix.Float2(r2.rects[0].x, r2.rects[0].y) * tile_size
-            screen.rect(p0, size=(32, 32))
+        size = pix.Int2(120, 75)
+        self.map = Map(size)
 
-    time = screen.seconds
-    tick = False
-    if time >= next_time:
-        tick = True
-        pos = target
-        next_time = time + interval
+        print(self.seed)
+        # map.join_rooms()
 
-    sprite = sprites[int(frame) % 8]
-    screen.draw(image=sprite, top_left=pos + (8, 2), size=sprite.size * 2)
+        for p in self.con.grid_size.grid_coordinates():
+            self.con.put(p, 1024 + 3 * 32)
 
-    if tick:
-        if pix.is_pressed(pix.key.LEFT):
-            target = pos + (-s, 0)
-        if pix.is_pressed(pix.key.RIGHT):
-            target = pos + (s, 0)
-        if pix.is_pressed(pix.key.UP):
-            target = pos + (0, -s)
-        if pix.is_pressed(pix.key.DOWN):
-            target = pos + (0, s)
-        delta = target - pos
+        for xy in size.grid_coordinates():
+            t = self.map.tiles[xy.x + size.x * xy.y]
+            if t > 0:
+                self.con.put(xy, 0x20)
 
-    pos = pos + (delta * screen.delta / interval)
+        colors = [
+            pix.color.WHITE,
+            pix.color.LIGHT_BLUE,
+            pix.color.LIGHT_RED,
+            pix.color.LIGHT_GREY,
+            pix.color.ORANGE,
+        ]
+        for t, room in enumerate(self.map.rooms):
+            for u, r in enumerate(room.rects):
+                self.con.set_color(colors[u % 5], pix.color.BLACK)
+                self.con.put((r.x, r.y), 0x30 + t // 10)
+                self.con.put((r.x + 1, r.y), 0x30 + t % 10)
 
-    frame = (pos.x / 10) % 8
+        self.interval = 0.2
 
-    screen.swap()
+        self.next_time = pix.get_display().seconds + self.interval
+        self.delta = pix.Float2.ZERO
+
+    def update(self):
+        self.screen.draw(self.con, size=self.con.size)
+
+        p = pix.get_pointer().toi() // self.tile_size.toi()
+        size = self.map.size
+        t = self.map.tiles[p.x + size.x * p.y] - 10
+        self.con.cursor_pos = (0, 0)
+        self.con.set_color(pix.color.WHITE, pix.color.RED)
+        self.con.write(f"X {p.x:02} Y {p.y:02}  ")
+        if t >= 0:
+            room = self.map.rooms[t]
+            for c in room.connections:
+                r2 = self.map.rooms[c]
+                p0 = pix.Float2(r2.rects[0].x, r2.rects[0].y) * self.tile_size
+                self.screen.rect(p0, size=(32, 32))
+
+        time = pix.get_display().seconds
+        tick = False
+        if time >= self.next_time:
+            tick = True
+            # self.pos = self.target
+            self.next_time = time + self.interval
+
+        sprite = self.sprites[int(self.frame) % 8]
+        self.screen.draw(image=sprite, top_left=self.pos + (8, 2), size=sprite.size * 2)
+
+        s = 32.0
+        if tick:
+            if pix.is_pressed(pix.key.LEFT):
+                self.target = self.pos + pix.Float2(-s, 0)
+            if pix.is_pressed(pix.key.RIGHT):
+                self.target = self.pos + pix.Float2(s, 0)
+            if pix.is_pressed(pix.key.UP):
+                self.target = self.pos + pix.Float2(0, -s)
+            if pix.is_pressed(pix.key.DOWN):
+                self.target = self.pos + pix.Float2(0, s)
+            self.delta = self.target - self.pos
+
+        self.pos = self.pos + (self.delta * pix.get_display().delta / self.interval)
+
+        self.frame = (self.pos.x / 10) % 8
+
+
+async def main():
+    client = Client()
+    async with client.connect():
+        screen = pix.open_display(size=(1280, 1024), full_screen=True, id="dungeon")
+
+        game = Game(screen)
+
+        while pix.run_loop():
+            screen.clear(0xFF0000FF)
+            game.update()
+            await asyncio.sleep(0.002)
+            if pix.was_pressed(pix.key.ESCAPE):
+                break
+            screen.swap()
+    print("EXIT")
+    client.quit()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

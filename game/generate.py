@@ -121,6 +121,7 @@ class Room:
 
 class Map:
     def __init__(self, size: Int2):
+        self.size = size
         self.rooms: list[Room] = []
 
         self.width: Final = size.x

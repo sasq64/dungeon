@@ -24,7 +24,7 @@ class Client:
             unpacker = msgpack.Unpacker(raw=False)
 
             turn = -1
-            while True:
+            while self.running:
                 data = await reader.read(4096)
                 unpacker.feed(data)
                 for msg in unpacker:
@@ -46,6 +46,7 @@ class Client:
         _ = asyncio.create_task(self.handle(reader, writer))
 
     def __init__(self):
+        self.running = True
         repo_root = Path(__file__).resolve().parents[1]
         ca_path = repo_root / "server" / "server.crt"
         if not ca_path.exists():
@@ -59,17 +60,17 @@ class Client:
         self.configuration.verify_mode = ssl.CERT_REQUIRED
         self.configuration.load_verify_locations(cafile=str(ca_path))
 
-    async def connect(self):
+    def quit(self):
+        self.running = False
+
+    def connect(self):
         logger.info("Connecting to 127.0.0.1:5000...")
-        async with connect(
+        return connect(
             "127.0.0.1",
             5000,
             configuration=self.configuration,
             stream_handler=self.run_client,
-        ) as client:
-            logger.info("Connected to server")
-            # Keep the connection alive to receive streams
-            await asyncio.sleep(500)
+        )
 
 
 async def main():
