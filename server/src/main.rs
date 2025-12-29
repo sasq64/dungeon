@@ -1,5 +1,4 @@
 use anyhow::Result;
-use num_enum::FromPrimitive;
 use num_enum::IntoPrimitive;
 use num_enum::TryFromPrimitive;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -21,9 +20,6 @@ use std::{
 };
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until, timeout};
-
-#[macro_use]
-extern crate num_derive;
 
 fn load_certs(path: &Path) -> Vec<CertificateDer<'static>> {
     let mut reader = BufReader::new(File::open(path).unwrap());
