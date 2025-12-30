@@ -54,35 +54,35 @@ class Client:
         try:
             logger.info("Server initiated a bidirectional stream")
 
-            unpacker = msgpack.Unpacker(raw=False)
-
             _turn = -1
             while self.running:
-                data = await reader.read(4096)
-                unpacker.feed(data)
-                for msg in unpacker:
-                    if msg[0] == 1:
-                        self.id = msg[1]
-                        print(f"I am {self.id}")
+                data = await reader.readexactly(2)
+                (sz,) = struct.unpack(">H", data)
+                print(f"LEN {sz} packet")
+                data = await reader.readexactly(sz)
+                msg = msgpack.unpackb(data)
+                if msg[0] == 1:
+                    self.id = msg[1]
+                    print(f"I am {self.id}")
 
-                    elif msg[0] == 2:  # TURN
-                        turn = msg[1]
-                        print(f"TURN {turn}")
-                        d2 = []
-                        if self.target:
-                            d2 = msgpack.packb([3, self.target[0], self.target[1]])
-                            self.target = None
-                        else:
-                            d2 = msgpack.packb([0])
-                        print("WRITE")
-                        payload = struct.pack(">I", len(d2))
-                        writer.write(payload)
-                        writer.write(d2)
-                    elif msg[0] == 3:  # MOVE
-                        id = msg[1]
-                        x = msg[2]
-                        y = msg[3]
-                        self.moved_to = (x, y)
+                elif msg[0] == 2:  # TURN
+                    turn = msg[1]
+                    print(f"TURN {turn}")
+                    d2 = []
+                    if self.target:
+                        d2 = msgpack.packb([3, self.target[0], self.target[1]])
+                        self.target = None
+                    else:
+                        d2 = msgpack.packb([0])
+                    print("WRITE")
+                    payload = struct.pack(">H", len(d2))
+                    writer.write(payload)
+                    writer.write(d2)
+                elif msg[0] == 3:  # MOVE
+                    id = msg[1]
+                    x = msg[2]
+                    y = msg[3]
+                    self.moved_to = (x, y)
 
                     print(msg)
             # Send a response back to the server
@@ -117,12 +117,14 @@ class Client:
             ),
         )
         if self.connection:
+            print("ENTER")
             await self.connection.__aenter__()
 
 
 async def main():
     client = Client()
     await client.connect()
+    await asyncio.sleep(5000)
 
 
 if __name__ == "__main__":
