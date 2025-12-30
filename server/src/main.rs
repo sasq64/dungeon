@@ -136,9 +136,11 @@ enum Command {
     Attack(RelPos),
 }
 
+#[derive(Default, Debug)]
 struct Player {
     x: u32,
     y: u32,
+    moved: bool,
 }
 
 struct GameState {
@@ -237,7 +239,7 @@ async fn main() -> Result<()> {
                     let mut command: Option<Command> = None;
                     while command.is_none() {
                         if let Ok(res) = timeout(
-                            Duration::from_secs(1),
+                            Duration::from_secs(60),
                             read_packet(&mut recv_stream, &mut target),
                         )
                         .await
@@ -291,8 +293,18 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             } else {
                 debug!("Turn {turn}");
+                let mut output = Vec::new();
+                let mut s = state.lock().unwrap();
+                for (id, player) in &mut s.players {
+                    if player.moved {
+                        player.moved = false;
+                        let buf = make_packet!(NetCmd::MoveTo, *id, player.x, player.y);
+                        output.extend_from_slice(&buf);
+                    }
+                }
                 let buf = make_packet!(NetCmd::Turn, turn);
-                turn_tx.send((turn, buf)).unwrap();
+                output.extend_from_slice(&buf);
+                turn_tx.send((turn, output)).unwrap();
                 turn += 1;
             }
             // Get all client commands
@@ -302,7 +314,7 @@ async fn main() -> Result<()> {
                 {
                     let mut s = state.lock().unwrap();
                     match cmd {
-                        Command::AddPlayer => _ = s.players.insert(id, Player { x: 0, y: 0 }),
+                        Command::AddPlayer => _ = s.players.insert(id, Player::default()),
                         Command::TimeoutPlayer => {
                             _ = s.players.remove(&id);
                             debug!("Removed player {id}");
@@ -312,7 +324,7 @@ async fn main() -> Result<()> {
                             let player = s.players.get_mut(&id).unwrap();
                             player.x = x;
                             player.y = y;
-                            let _buf = make_packet!(NetCmd::MoveTo, id, player.x, player.y);
+                            player.moved = true;
                         }
                         _ => (),
                     }

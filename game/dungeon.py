@@ -71,11 +71,14 @@ class Game:
 
         self.xy = self.map.rooms[9].rects[0].center
         self.pos = self.xy.tof()
+        self.pos = pix.Float2(1, 1)
         self.target = self.pos
 
-        self.next_time = pix.get_display().seconds + self.interval
+        self.next_time = pix.get_seconds() + self.interval
         self.delta = pix.Float2.ZERO
         self.moving = 0
+        self.waiting_turn = False
+        self.current_turn = -1
 
     def update(self):
         self.screen.draw(self.con, size=self.con.size)
@@ -94,31 +97,11 @@ class Game:
                     p0 = pix.Float2(r2.rects[0].x, r2.rects[0].y) * self.tile_size
                     self.screen.rect(p0, size=(32, 32))
 
-        time = pix.get_display().seconds
-        tick = False
-        if time >= self.next_time:
-            tick = True
-            # self.pos = self.target
-            self.next_time = time + self.interval
-
-        pos = self.pos * self.tile_size
-        if self.moving > 0:
-            c = 1.0 - (self.moving / 16)
-            d = (self.target - self.pos) * self.tile_size * c
-            pos += d
-            self.moving -= 1
-            if self.moving == 0:
-                print("ARRIVE")
-                self.pos = self.target
-                if pix.is_pressed(pix.key.LEFT):
-                    self.target = self.pos + (-1, 0)
-                if pix.is_pressed(pix.key.RIGHT):
-                    self.target = self.pos + (1, 0)
-                if pix.is_pressed(pix.key.UP):
-                    self.target = self.pos + (0, -1)
-                if pix.is_pressed(pix.key.DOWN):
-                    self.target = self.pos + (0, 1)
-        else:
+        new_turn = self.client.get_new_turn()
+        if new_turn is not None:
+            self.current_turn = new_turn
+            self.waiting_turn = True
+        if self.waiting_turn:
             if pix.was_pressed(pix.key.LEFT):
                 self.target = self.pos + (-1, 0)
             if pix.was_pressed(pix.key.RIGHT):
@@ -127,30 +110,29 @@ class Game:
                 self.target = self.pos + (0, -1)
             if pix.was_pressed(pix.key.DOWN):
                 self.target = self.pos + (0, 1)
-        if self.moving == 0 and self.pos != self.target:
-            print("DIFF")
-            t = self.target.toi()
-            self.client.move_to(t.x, t.y)
-            self.moving = 16
+            if self.pos != self.target:
+                t = self.target.toi()
+                self.client.move_to(t.x, t.y)
+                self.waiting_turn = False
+                # self.pos = self.target
+        new_pos = self.client.get_moved()
+        if new_pos is not None:
+            self.pos = pix.Float2(new_pos[0], new_pos[1])
 
+        arrows = 10 * 32 + 17
+
+        if self.pos != self.target:
+            d = (self.target - self.pos).toi()
+            idx = arrows + d.x + d.y * 32
+            img = self.tiles[idx]
+            self.screen.draw(
+                image=img, top_left=self.target * self.tile_size, size=img.size
+            )
+
+        pos = (self.pos * self.tile_size) - (40, 40)
         frame = (pos.x / 10) % 8
         sprite = self.sprites[int(frame) % 8]
-
         self.screen.draw(image=sprite, top_left=pos, size=sprite.size)
-
-        # s = 16.0
-        # if tick:
-        #     if pix.is_pressed(pix.key.LEFT):
-        #         self.target = self.pos + pix.Float2(-s, 0)
-        #     if pix.is_pressed(pix.key.RIGHT):
-        #         self.target = self.pos + pix.Float2(s, 0)
-        #     if pix.is_pressed(pix.key.UP):
-        #         self.target = self.pos + pix.Float2(0, -s)
-        #     if pix.is_pressed(pix.key.DOWN):
-        #         self.target = self.pos + pix.Float2(0, s)
-        #     self.delta = self.target - self.pos
-        #
-        # self.pos = self.pos + (self.delta * pix.get_display().delta / self.interval)
 
 
 async def main():

@@ -44,6 +44,9 @@ class Client:
         self.target: tuple[int, int] | None = None
         self.moved_to: tuple[int, int] | None = None
         self.id = 0
+        self.turn_event = asyncio.Event()
+        self.writer: StreamWriter | None = None
+        self.turn: int | None = None
 
     def get_moved(self) -> tuple[int, int] | None:
         res = self.moved_to
@@ -51,6 +54,7 @@ class Client:
         return res
 
     async def handle(self, reader: StreamReader, writer: StreamWriter):
+        self.writer = writer
         try:
             logger.info("Server initiated a bidirectional stream")
 
@@ -68,21 +72,14 @@ class Client:
                 elif msg[0] == 2:  # TURN
                     turn = msg[1]
                     print(f"TURN {turn}")
-                    d2 = []
-                    if self.target:
-                        d2 = msgpack.packb([3, self.target[0], self.target[1]])
-                        self.target = None
-                    else:
-                        d2 = msgpack.packb([0])
-                    print("WRITE")
-                    payload = struct.pack(">H", len(d2))
-                    writer.write(payload)
-                    writer.write(d2)
+                    self.turn = turn
                 elif msg[0] == 3:  # MOVE
                     id = msg[1]
                     x = msg[2]
                     y = msg[3]
-                    self.moved_to = (x, y)
+                    if id == self.id:
+                        print(f"I moved to {x} {y}")
+                        self.moved_to = (x, y)
 
                     print(msg)
             # Send a response back to the server
@@ -96,8 +93,19 @@ class Client:
     def run_client(self, reader: StreamReader, writer: StreamWriter):
         _ = asyncio.create_task(self.handle(reader, writer))
 
+    def get_new_turn(self) -> int | None:
+        t = self.turn
+        self.turn = None
+        return t
+
     def move_to(self, x: int, y: int):
-        self.target = (x, y)
+        if not self.writer:
+            return
+        d2 = msgpack.packb([3, x, y])
+        print("WRITE")
+        payload = struct.pack(">H", len(d2))
+        self.writer.write(payload)
+        self.writer.write(d2)
 
     async def quit(self):
         self.running = False
