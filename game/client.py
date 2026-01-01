@@ -1,5 +1,4 @@
 import asyncio
-from dataclasses import dataclass
 import logging
 import ssl
 import struct
@@ -7,6 +6,7 @@ import sys
 from asyncio import StreamReader, StreamWriter
 from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -19,6 +19,10 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def log(msg: str):
+    logger.info(msg)
 
 
 Pass = 0
@@ -34,8 +38,8 @@ class Player:
     id: int
     x: int
     y: int
-    color: int
     tile: int
+    color: int
 
 
 class Client:
@@ -81,32 +85,38 @@ class Client:
             while self.running:
                 data = await reader.readexactly(2)
                 (sz,) = struct.unpack(">H", data)
-                print(f"LEN {sz} packet")
                 data = await reader.readexactly(sz)
                 msg = msgpack.unpackb(data)
                 if msg[0] == YouAre:
                     self.id = msg[1]
-                    print(f"I am {self.id}")
-
-                elif msg[0] == Turn:  # TURN
+                    log(f"I AM {self.id}")
+                    self.players[self.id] = Player(self.id, 1, 1, 0, 0xFFFFFF)
+                elif msg[0] == Turn:
                     turn = msg[1]
-                    print(f"TURN {turn}")
+                    log(f"TURN {turn}")
                     self.turn = turn
+                    self.turn_event.set()
                 elif msg[0] == PlayerJoin:
                     id, tile, color = msg[1:]
+                    log(f"JOIN {id} {tile} {color}")
                     self.players[id] = Player(id, -1, -1, tile, color)
 
-                elif msg[0] == MoveTo:  # MOVE
+                elif msg[0] == MoveTo:
                     id, x, y = msg[1:]
-                    p = self.players[id]
-                    p.x = x
-                    p.y = y
+                    if not id in self.players:
+                        self.players[id] = Player(id, -1, -1, 1, 0xFFFFFF)
+                    if id in self.players:
+                        p = self.players[id]
+                        p.x = x
+                        p.y = y
+                    else:
+                        log(f"Unknown player {id} moved")
 
                     if id == self.id:
-                        print(f"I moved to {x} {y}")
+                        log(f"I moved to {x} {y}")
                         self.moved_to = (x, y)
 
-                    print(msg)
+                    log(msg)
             # Send a response back to the server
             # writer.write(b"Hello from Python client!")
             # writer.write_eof()
@@ -130,7 +140,7 @@ class Client:
         if not self.writer:
             return
         d2 = msgpack.packb([3, x, y])
-        print("WRITE")
+        print(f"PACKAGE {x} {y}")
         payload = struct.pack(">H", len(d2))
         self.writer.write(payload)
         self.writer.write(d2)
@@ -153,14 +163,20 @@ class Client:
             ),
         )
         if self.connection:
-            print("ENTER")
             await self.connection.__aenter__()
 
 
 async def main():
     client = Client()
     await client.connect()
-    await asyncio.sleep(5000)
+    x = 5
+    y = 5
+    while True:
+        await client.turn_event.wait()
+        print(f"TURN {client.turn}")
+        await asyncio.sleep(4.0)
+        client.move_to(x, y)
+        x = x + 1
 
 
 if __name__ == "__main__":

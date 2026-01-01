@@ -74,7 +74,7 @@ class Game:
         self.pos = pix.Float2(1, 1)
         self.target = self.pos
 
-        self.next_time = pix.get_seconds() + self.interval
+        # self.next_time = pix.get_seconds() + self.interval
         self.delta = pix.Float2.ZERO
         self.moving = 0
         self.waiting_turn = False
@@ -99,25 +99,31 @@ class Game:
 
         new_turn = self.client.get_new_turn()
         if new_turn is not None:
+            print(f"New turn {new_turn}")
             self.current_turn = new_turn
             self.waiting_turn = True
         if self.waiting_turn:
+            target = self.pos
             if pix.was_pressed(pix.key.LEFT):
-                self.target = self.pos + (-1, 0)
+                target = self.pos + (-1, 0)
             if pix.was_pressed(pix.key.RIGHT):
-                self.target = self.pos + (1, 0)
+                target = self.pos + (1, 0)
             if pix.was_pressed(pix.key.UP):
-                self.target = self.pos + (0, -1)
+                target = self.pos + (0, -1)
             if pix.was_pressed(pix.key.DOWN):
-                self.target = self.pos + (0, 1)
-            if self.pos != self.target:
+                target = self.pos + (0, 1)
+            if self.pos != target:
+                self.target = target
                 t = self.target.toi()
                 self.client.move_to(t.x, t.y)
                 self.waiting_turn = False
                 # self.pos = self.target
+
         new_pos = self.client.get_moved()
         if new_pos is not None:
+            print("Moved OK")
             self.pos = pix.Float2(new_pos[0], new_pos[1])
+            self.target = self.pos
 
         arrows = 10 * 32 + 17
 
@@ -132,9 +138,10 @@ class Game:
         for player in self.client.get_players().values():
             if player.id == self.client.id:
                 continue
-            tile = self.tiles[player.tile]
-            pos = pix.Float2(player.x, player.y) * self.tile_size
-            self.screen.draw(image=tile, top_left=pos, size=tile.size)
+            if player.x >= 0:
+                tile = self.tiles[player.tile]
+                pos = pix.Float2(player.x, player.y) * self.tile_size
+                self.screen.draw(image=tile, top_left=pos, size=tile.size)
 
         pos = (self.pos * self.tile_size) - (40, 40)
         frame = (pos.x / 10) % 8
