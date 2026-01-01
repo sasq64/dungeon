@@ -1,6 +1,7 @@
 use anyhow::Result;
 use num_enum::IntoPrimitive;
 use num_enum::TryFromPrimitive;
+use quinn::Connection;
 use quinn::RecvStream;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Endpoint, ServerConfig};
@@ -11,14 +12,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::mpsc::Sender;
-//use std::sync::mpsc::Sender;
 use std::time::Duration;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::debug;
@@ -60,8 +60,7 @@ fn make_server_config() -> Result<(ServerConfig, CertificateDer<'static>)> {
 
     let mut rustls_config = RustlsServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(cert_chain, key)
-        .unwrap();
+        .with_single_cert(cert_chain, key)?;
     rustls_config.alpn_protocols = vec![b"h3".to_vec()];
 
     let quic_crypto = QuicServerConfig::try_from(rustls_config)?;
@@ -126,16 +125,12 @@ enum NetCmd {
     PlayerLeave = 5,
 }
 
-type Dir = u8;
-type RelPos = (u8, u8);
 #[derive(Debug)]
 enum Command {
     Wait,
     AddPlayer(Sender<Vec<u8>>),
     TimeoutPlayer,
-    Move(Dir),
     MoveTo(u32, u32),
-    Attack(RelPos),
     Done(usize),
 }
 
@@ -188,131 +183,111 @@ fn decode_packet(source: &[u8]) -> Result<Vec<i64>> {
     Ok(result)
 }
 
-async fn run_client() -> Result<()> {
-    Ok(())
+struct Client {
+    conn: Connection,
+    player_count: Arc<AtomicU64>,
+    turn_rx: tokio::sync::watch::Receiver<(usize, Vec<u8>)>,
+    cmd_tx: Sender<(u64, Command)>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+impl Client {
+    async fn run(mut self) -> Result<()> {
+        let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (mut send_stream, mut recv_stream) = self.conn.open_bi().await?;
+        let mut target = vec![0; 128];
+        let id = self.player_count.fetch_add(1, Ordering::SeqCst);
+        self.cmd_tx
+            .send((id, Command::AddPlayer(client_tx)))
+            .await?;
 
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let buf = make_packet!(NetCmd::YouAre, id);
+        send_stream.write(&buf).await?;
+        debug!("Player {id} loop starting");
+        let mut connected = true;
 
-    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
-    let (endpoint, _server_cert) = make_server_endpoint(server_addr)?;
+        while connected && self.turn_rx.changed().await.is_ok() {
+            trace!("Start loop");
+            while let Ok(data) = client_rx.try_recv() {
+                if !data.is_empty() && send_stream.write_all(&data).await.is_err() {
+                    self.cmd_tx.send((id, Command::TimeoutPlayer)).await?;
+                    trace!("BREAK");
+                    break;
+                }
+            }
+            if !connected {
+                trace!("BREAK");
+                break;
+            }
 
-    // From ooordinator to all clients; turn no and bytes to send
-    let (turn_tx, turn_rx) = watch::channel::<(usize, Vec<u8>)>((0, vec![]));
-
-    // From client handler to coordinator
-    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<(u64, Command)>(128);
-
-    // Server accept loop
-    let handle = tokio::spawn(async move {
-        let player_count: Arc<AtomicU64> = Arc::new(0.into());
-        loop {
-            let incoming_conn = endpoint.accept().await.unwrap();
-            let conn = incoming_conn.await.unwrap();
-            debug!("Accepted cient from {}", conn.remote_address());
-            let player_count = player_count.clone();
-            let mut turn_rx = turn_rx.clone();
-            let cmd_tx = cmd_tx.clone();
-            // Client loop
-            let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-            tokio::spawn(async move {
-                let (mut send_stream, mut recv_stream) = conn.open_bi().await.unwrap();
-                let mut target = vec![0; 128];
-                let id = player_count.fetch_add(1, Ordering::SeqCst);
-                cmd_tx
-                    .send((id, Command::AddPlayer(client_tx)))
-                    .await
-                    .unwrap();
-
-                let buf = make_packet!(NetCmd::YouAre, id);
-                send_stream.write(&buf).await.unwrap();
-                debug!("Player {id} loop starting");
-                let mut connected = true;
-
-                while connected && turn_rx.changed().await.is_ok() {
-                    trace!("Start loop");
-                    while let Ok(data) = client_rx.try_recv() {
-                        if !data.is_empty() && send_stream.write_all(&data).await.is_err() {
-                            cmd_tx.send((id, Command::TimeoutPlayer)).await.unwrap();
-                            trace!("BREAK");
-                            break;
-                        }
-                    }
-                    if !connected {
-                        trace!("BREAK");
-                        break;
-                    }
-
-                    trace!("Read turn watch");
-                    let (turn, data) = turn_rx.borrow_and_update().clone();
-                    if !data.is_empty() && send_stream.write_all(&data).await.is_err() {
-                        cmd_tx.send((id, Command::TimeoutPlayer)).await.unwrap();
-                        trace!("BREAK");
-                        break;
-                    }
-                    debug!("Player {id} turn {turn}");
-                    // let bytes = rmp_serde::to_vec(&msg).unwrap();
-                    // send_stream.write(&bytes).await.unwrap();
-                    let mut command: Option<Command> = None;
-                    while command.is_none() {
-                        if let Ok(res) = timeout(
-                            Duration::from_secs(600),
-                            read_packet(&mut recv_stream, &mut target),
-                        )
-                        .await
-                        {
-                            match res {
-                                Ok(count) => {
-                                    trace!("Read {:x?}", &target[0..count]);
-                                    let packet = decode_packet(&target[..count]).unwrap();
-                                    match NetCmd::try_from(packet[0] as u8) {
-                                        Ok(NetCmd::MoveTo) => {
-                                            let x = packet[1] as u32;
-                                            let y = packet[2] as u32;
-                                            trace!("Move To {x} {y}");
-                                            command = Some(Command::MoveTo(x, y));
-                                        }
-                                        Ok(NetCmd::Pass) => {
-                                            command = Some(Command::Wait);
-                                        }
-                                        Ok(NetCmd::Turn) => {}
-                                        _ => {}
-                                    }
+            trace!("Read turn watch");
+            let (turn, data) = self.turn_rx.borrow_and_update().clone();
+            if !data.is_empty() && send_stream.write_all(&data).await.is_err() {
+                self.cmd_tx.send((id, Command::TimeoutPlayer)).await?;
+                trace!("BREAK");
+                break;
+            }
+            debug!("Player {id} turn {turn}");
+            // let bytes = rmp_serde::to_vec(&msg).unwrap();
+            // send_stream.write(&bytes).await.unwrap();
+            let mut command: Option<Command> = None;
+            while command.is_none() {
+                if let Ok(res) = timeout(
+                    Duration::from_secs(600),
+                    read_packet(&mut recv_stream, &mut target),
+                )
+                .await
+                {
+                    match res {
+                        Ok(count) => {
+                            trace!("Read {:x?}", &target[0..count]);
+                            let packet = decode_packet(&target[..count])?;
+                            match NetCmd::try_from(packet[0] as u8) {
+                                Ok(NetCmd::MoveTo) => {
+                                    let x = packet[1] as u32;
+                                    let y = packet[2] as u32;
+                                    trace!("Move To {x} {y}");
+                                    command = Some(Command::MoveTo(x, y));
                                 }
-                                Err(e) => {
-                                    warn!("Error: {:?}", e);
-                                    command = Some(Command::TimeoutPlayer);
-                                    connected = false;
+                                Ok(NetCmd::Pass) => {
+                                    command = Some(Command::Wait);
                                 }
+                                Ok(NetCmd::Turn) => {}
+                                _ => {}
                             }
-                        } else {
-                            // Timeout
-                            warn!("Timeout");
+                        }
+                        Err(e) => {
+                            warn!("Error: {:?}", e);
                             command = Some(Command::TimeoutPlayer);
                             connected = false;
                         }
                     }
-                    if let Some(command) = command {
-                        trace!("Client {id} command {command:?}");
-                        cmd_tx.send((id, command)).await.unwrap();
-                        if connected {
-                            cmd_tx.send((id, Command::Done(turn))).await.unwrap();
-                        }
-                    }
+                } else {
+                    // Timeout
+                    warn!("Timeout");
+                    command = Some(Command::TimeoutPlayer);
+                    connected = false;
                 }
-                debug!("Client {id} exit loop");
-            });
+            }
+            if let Some(command) = command {
+                trace!("Client {id} command {command:?}");
+                self.cmd_tx.send((id, command)).await?;
+                if connected {
+                    self.cmd_tx.send((id, Command::Done(turn))).await?;
+                }
+            }
         }
-    });
+        debug!("Client {id} exit loop");
+        Ok(())
+    }
+}
 
-    // Server main loop
-    tokio::spawn(async move {
+struct Server {
+    turn_tx: tokio::sync::watch::Sender<(usize, Vec<u8>)>,
+    cmd_rx: tokio::sync::mpsc::Receiver<(u64, Command)>,
+}
+
+impl Server {
+    async fn run(mut self) -> Result<()> {
         let mut state = GameState {
             players: HashMap::new(),
         };
@@ -338,12 +313,12 @@ async fn main() -> Result<()> {
             let buf = make_packet!(NetCmd::Turn, turn);
             output.extend_from_slice(&buf);
             trace!("Send turn {turn}");
-            turn_tx.send((turn, output)).unwrap();
+            self.turn_tx.send((turn, output)).unwrap();
             trace!("Send done");
             //}
             // Get all client commands
             loop {
-                let (id, cmd) = cmd_rx.recv().await.unwrap();
+                let (id, cmd) = self.cmd_rx.recv().await.unwrap();
                 debug!("Client {id} reported {:?}", cmd);
                 {
                     match cmd {
@@ -393,24 +368,49 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+    let (endpoint, _server_cert) = make_server_endpoint(server_addr)?;
+
+    // From ooordinator to all clients; turn no and bytes to send
+    let (turn_tx, turn_rx) = watch::channel::<(usize, Vec<u8>)>((0, vec![]));
+
+    // From client handler to coordinator
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<(u64, Command)>(128);
+
+    // Server accept loop
+    let handle = tokio::spawn(async move {
+        let player_count: Arc<AtomicU64> = Arc::new(0.into());
+        loop {
+            let incoming_conn = endpoint.accept().await.unwrap();
+            let conn = incoming_conn.await.unwrap();
+            debug!("Accepted cient from {}", conn.remote_address());
+            let player_count = player_count.clone();
+            let turn_rx = turn_rx.clone();
+            let cmd_tx = cmd_tx.clone();
+
+            let client = Client {
+                conn,
+                player_count,
+                turn_rx,
+                cmd_tx,
+            };
+            tokio::spawn(client.run());
+        }
     });
 
-    // let endpoint = make_client_endpoint("0.0.0.0:0".parse()?)?;
-    // // connect to server
-    // let connection = endpoint.connect(server_addr, "localhost")?.await?;
-    // println!("[client] connected: addr={}", connection.remote_address());
-    //
-    // // Waiting for a stream will complete with an error when the server closes the connection
-    // let (mut s, mut r) = connection.accept_bi().await?;
-    // let mut target = vec![0; 128];
-    // if let Some(count) = r.read(&mut target).await? {
-    //     println!("READ {count} {}", target[0]);
-    //     //s.write(&target[0..1]).await?;
-    // }
-    //
-    // // Make sure the server has a chance to clean up
-    // endpoint.wait_idle().await;
-
+    let server = Server { turn_tx, cmd_rx };
+    tokio::spawn(server.run());
     _ = handle.await?;
     Ok(())
 }
