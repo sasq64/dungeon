@@ -122,6 +122,8 @@ enum NetCmd {
     YouAre = 1,
     Turn = 2,
     MoveTo = 3,
+    PlayerJoin = 4,
+    PlayerLeave = 5,
 }
 
 type Dir = u8;
@@ -149,17 +151,19 @@ struct GameState {
 
 /// Create a framed msgpack packet
 macro_rules! make_packet {
-    ($($val:expr),+) => {{
-        let count = [$(stringify!($val)),+].len();
-        let mut buf : Vec<u8> = vec![0,0];
-        _ = rmp::encode::write_array_len(&mut buf, count as u32);
-        $(
-            _ = rmp::encode::write_uint(&mut buf, $val as u64);
-        )+
-        let t = u16::to_be_bytes((buf.len() - 2) as u16);
-        buf[0..2].copy_from_slice(&t);
-        buf
-    }};
+    ($($val:expr),+) => {
+        {
+            let count = [$(stringify!($val)),+].len();
+            let mut buf : Vec<u8> = vec![0,0];
+            _ = rmp::encode::write_array_len(&mut buf, count as u32);
+            $(
+                _ = rmp::encode::write_uint(&mut buf, $val as u64);
+            )+
+            let t = u16::to_be_bytes((buf.len() - 2) as u16);
+            buf[0..2].copy_from_slice(&t);
+            buf
+        }
+    };
 }
 
 async fn read_packet(recv_stream: &mut RecvStream, target: &mut [u8]) -> Result<usize> {
@@ -226,12 +230,9 @@ async fn main() -> Result<()> {
 
                 while turn_rx.changed().await.is_ok() {
                     let (turn, data) = turn_rx.borrow_and_update().clone();
-                    if !data.is_empty() {
-                        let res = send_stream.write(&data).await;
-                        if let Err(_) = res {
-                            cmd_tx.send((id, Command::TimeoutPlayer)).await.unwrap();
-                            break;
-                        }
+                    if !data.is_empty() && send_stream.write_all(&data).await.is_err() {
+                        cmd_tx.send((id, Command::TimeoutPlayer)).await.unwrap();
+                        break;
                     }
                     debug!("Player {id} turn {turn}");
                     // let bytes = rmp_serde::to_vec(&msg).unwrap();
@@ -288,12 +289,14 @@ async fn main() -> Result<()> {
         let mut ids = HashSet::new();
         ids.insert(0);
         let mut turn = 0;
+        let mut out_data = Vec::<u8>::new();
         loop {
             if state.lock().unwrap().players.is_empty() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             } else {
                 debug!("Turn {turn}");
-                let mut output = Vec::new();
+                let mut output = out_data.clone();
+                out_data.clear();
                 let mut s = state.lock().unwrap();
                 for (id, player) in &mut s.players {
                     if player.moved {
@@ -314,7 +317,12 @@ async fn main() -> Result<()> {
                 {
                     let mut s = state.lock().unwrap();
                     match cmd {
-                        Command::AddPlayer => _ = s.players.insert(id, Player::default()),
+                        Command::AddPlayer => {
+                            let new_player = Player::default();
+                            let buf = make_packet!(NetCmd::PlayerJoin, id, 1, 0xffffff);
+                            out_data.extend_from_slice(&buf);
+                            _ = s.players.insert(id, new_player);
+                        }
                         Command::TimeoutPlayer => {
                             _ = s.players.remove(&id);
                             debug!("Removed player {id}");

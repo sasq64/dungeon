@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 import logging
 import ssl
 import struct
@@ -18,6 +19,23 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+Pass = 0
+YouAre = 1
+Turn = 2
+MoveTo = 3
+PlayerJoin = 4
+PlayerLeave = 5
+
+
+@dataclass
+class Player:
+    id: int
+    x: int
+    y: int
+    color: int
+    tile: int
 
 
 class Client:
@@ -47,6 +65,7 @@ class Client:
         self.turn_event = asyncio.Event()
         self.writer: StreamWriter | None = None
         self.turn: int | None = None
+        self.players: dict[int, Player] = {}
 
     def get_moved(self) -> tuple[int, int] | None:
         res = self.moved_to
@@ -65,18 +84,24 @@ class Client:
                 print(f"LEN {sz} packet")
                 data = await reader.readexactly(sz)
                 msg = msgpack.unpackb(data)
-                if msg[0] == 1:
+                if msg[0] == YouAre:
                     self.id = msg[1]
                     print(f"I am {self.id}")
 
-                elif msg[0] == 2:  # TURN
+                elif msg[0] == Turn:  # TURN
                     turn = msg[1]
                     print(f"TURN {turn}")
                     self.turn = turn
-                elif msg[0] == 3:  # MOVE
-                    id = msg[1]
-                    x = msg[2]
-                    y = msg[3]
+                elif msg[0] == PlayerJoin:
+                    id, tile, color = msg[1:]
+                    self.players[id] = Player(id, -1, -1, tile, color)
+
+                elif msg[0] == MoveTo:  # MOVE
+                    id, x, y = msg[1:]
+                    p = self.players[id]
+                    p.x = x
+                    p.y = y
+
                     if id == self.id:
                         print(f"I moved to {x} {y}")
                         self.moved_to = (x, y)
@@ -89,6 +114,9 @@ class Client:
             logger.info("Response sent to server")
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
+
+    def get_players(self) -> dict[int, Player]:
+        return self.players
 
     def run_client(self, reader: StreamReader, writer: StreamWriter):
         _ = asyncio.create_task(self.handle(reader, writer))

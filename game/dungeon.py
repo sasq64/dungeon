@@ -129,6 +129,13 @@ class Game:
                 image=img, top_left=self.target * self.tile_size, size=img.size
             )
 
+        for player in self.client.get_players().values():
+            if player.id == self.client.id:
+                continue
+            tile = self.tiles[player.tile]
+            pos = pix.Float2(player.x, player.y) * self.tile_size
+            self.screen.draw(image=tile, top_left=pos, size=tile.size)
+
         pos = (self.pos * self.tile_size) - (40, 40)
         frame = (pos.x / 10) % 8
         sprite = self.sprites[int(frame) % 8]
