@@ -152,6 +152,23 @@ macro_rules! make_packet {
     };
 }
 
+macro_rules! make_packet_to {
+    ($target:expr, $($val:expr),+) => {
+        {
+            let count = [$(stringify!($val)),+].len();
+            let start = $target.len();
+            $target.push(0);
+            $target.push(0);
+            _  = rmp::encode::write_array_len($target, count as u32);
+            $(
+                _ = rmp::encode::write_uint($target, $val as u64);
+            )+
+            let t = u16::to_be_bytes(($target.len() - start - 2).try_into().unwrap());
+            $target[start..start+2].copy_from_slice(&t);
+        }
+    };
+}
+
 async fn read_packet(recv_stream: &mut quinn::RecvStream, target: &mut [u8]) -> Result<usize> {
     let mut t = [0u8; 2];
     recv_stream.read_exact(&mut t).await?;
@@ -301,12 +318,10 @@ impl Server {
                 if player.moved {
                     player.moved = false;
                     trace!("Player {id} moved");
-                    let buf = make_packet!(NetCmd::MoveTo, *id, player.x, player.y);
-                    output.extend_from_slice(&buf);
+                    make_packet_to!(&mut output, NetCmd::MoveTo, *id, player.x, player.y);
                 }
             }
-            let buf = make_packet!(NetCmd::Turn, turn);
-            output.extend_from_slice(&buf);
+            make_packet_to!(&mut output, NetCmd::Turn, turn);
             trace!("Send turn {turn}");
             self.turn_tx.send((turn, output)).unwrap();
             trace!("Send done");
