@@ -18,7 +18,7 @@ use std::{
     sync::Arc,
 };
 use tokio::select;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -115,12 +115,18 @@ enum NetCmd {
 }
 
 #[derive(Debug)]
-enum Command {
+enum ServerCommand {
     Wait,
-    AddPlayer(Sender<Vec<u8>>),
+    AddPlayer(mpsc::Sender<ClientCommand>),
     TimeoutPlayer,
     MoveTo(u32, u32),
     Done(usize),
+}
+
+#[derive(Debug)]
+enum ClientCommand {
+    Packets(Vec<u8>),
+    JoinGroup(u64, tokio::sync::watch::Receiver<(usize, Vec<u8>)>),
 }
 
 #[derive(Debug)]
@@ -128,7 +134,7 @@ struct Player {
     x: u32,
     y: u32,
     moved: bool,
-    sender: Sender<Vec<u8>>,
+    sender: mpsc::Sender<ClientCommand>,
 }
 
 struct GameState {
@@ -193,18 +199,20 @@ fn decode_packet(source: &[u8]) -> Result<Vec<i64>> {
 struct Client {
     conn: Connection,
     player_count: Arc<AtomicU64>,
-    turn_rx: tokio::sync::watch::Receiver<(usize, Vec<u8>)>,
-    cmd_tx: Sender<(u64, Command)>,
+    turn_rx: watch::Receiver<(usize, Vec<u8>)>,
+    cmd_tx: mpsc::Sender<(u64, ServerCommand)>,
+    client_rx: mpsc::Receiver<ClientCommand>,
+    client_tx: mpsc::Sender<ClientCommand>,
 }
 
 impl Client {
     async fn run(mut self) -> Result<()> {
-        let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        //let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let (mut send_stream, mut recv_stream) = self.conn.open_bi().await?;
         let mut target = vec![0; 128];
         let id = self.player_count.fetch_add(1, Ordering::SeqCst);
         self.cmd_tx
-            .send((id, Command::AddPlayer(client_tx)))
+            .send((id, ServerCommand::AddPlayer(self.client_tx)))
             .await?;
 
         let buf = make_packet!(NetCmd::YouAre, id);
@@ -214,11 +222,18 @@ impl Client {
 
         while connected && self.turn_rx.changed().await.is_ok() {
             trace!("Start loop");
-            while let Ok(data) = client_rx.try_recv() {
-                if !data.is_empty() && send_stream.write_all(&data).await.is_err() {
-                    self.cmd_tx.send((id, Command::TimeoutPlayer)).await?;
-                    trace!("BREAK");
-                    break;
+            while let Ok(cmd) = self.client_rx.try_recv() {
+                match cmd {
+                    ClientCommand::Packets(data) => {
+                        if !data.is_empty() && send_stream.write_all(&data).await.is_err() {
+                            self.cmd_tx.send((id, ServerCommand::TimeoutPlayer)).await?;
+                            trace!("BREAK");
+                            break;
+                        }
+                    }
+                    ClientCommand::JoinGroup(_id, watch) => {
+                        self.turn_rx = watch;
+                    }
                 }
             }
             if !connected {
@@ -229,14 +244,12 @@ impl Client {
             trace!(target = "client", "Read turn watch");
             let (turn, data) = self.turn_rx.borrow_and_update().clone();
             if !data.is_empty() && send_stream.write_all(&data).await.is_err() {
-                self.cmd_tx.send((id, Command::TimeoutPlayer)).await?;
+                self.cmd_tx.send((id, ServerCommand::TimeoutPlayer)).await?;
                 trace!("BREAK");
                 break;
             }
             debug!("Player {id} turn {turn}");
-            // let bytes = rmp_serde::to_vec(&msg).unwrap();
-            // send_stream.write(&bytes).await.unwrap();
-            let mut command: Option<Command> = None;
+            let mut command: Option<ServerCommand> = None;
             while command.is_none() {
                 if let Ok(res) = timeout(
                     Duration::from_secs(600),
@@ -254,10 +267,10 @@ impl Client {
                                         let x = packet[1] as u32;
                                         let y = packet[2] as u32;
                                         trace!("Move To {x} {y}");
-                                        command = Some(Command::MoveTo(x, y));
+                                        command = Some(ServerCommand::MoveTo(x, y));
                                     }
                                     NetCmd::Pass => {
-                                        command = Some(Command::Wait);
+                                        command = Some(ServerCommand::Wait);
                                     }
                                     NetCmd::Turn => {}
                                     _ => {}
@@ -269,14 +282,14 @@ impl Client {
                         }
                         Err(e) => {
                             warn!("Error: {:?}", e);
-                            command = Some(Command::TimeoutPlayer);
+                            command = Some(ServerCommand::TimeoutPlayer);
                             connected = false;
                         }
                     }
                 } else {
                     // Timeout
                     warn!("Timeout");
-                    command = Some(Command::TimeoutPlayer);
+                    command = Some(ServerCommand::TimeoutPlayer);
                     connected = false;
                 }
             }
@@ -284,7 +297,7 @@ impl Client {
                 trace!("Client {id} command {command:?}");
                 self.cmd_tx.send((id, command)).await?;
                 if connected {
-                    self.cmd_tx.send((id, Command::Done(turn))).await?;
+                    self.cmd_tx.send((id, ServerCommand::Done(turn))).await?;
                 }
             }
         }
@@ -295,7 +308,7 @@ impl Client {
 
 struct Server {
     turn_tx: tokio::sync::watch::Sender<(usize, Vec<u8>)>,
-    cmd_rx: tokio::sync::mpsc::Receiver<(u64, Command)>,
+    cmd_rx: tokio::sync::mpsc::Receiver<(u64, ServerCommand)>,
 }
 
 impl Server {
@@ -332,7 +345,7 @@ impl Server {
                 debug!("Client {id} reported {:?}", cmd);
                 {
                     match cmd {
-                        Command::AddPlayer(sender) => {
+                        ServerCommand::AddPlayer(sender) => {
                             let new_player = Player {
                                 x: 0,
                                 y: 0,
@@ -349,17 +362,17 @@ impl Server {
                             }
                             _ = state.players.insert(id, new_player);
                         }
-                        Command::TimeoutPlayer => {
+                        ServerCommand::TimeoutPlayer => {
                             _ = state.players.remove(&id);
                             debug!("Removed player {id}");
                         }
-                        Command::Done(done_turn) => {
+                        ServerCommand::Done(done_turn) => {
                             trace!("Done turn {done_turn}");
                             assert!(done_turn == turn);
                             ids.insert(id);
                         }
 
-                        Command::MoveTo(x, y) => {
+                        ServerCommand::MoveTo(x, y) => {
                             let player = state.players.get_mut(&id).unwrap();
                             player.x = x;
                             player.y = y;
@@ -398,7 +411,9 @@ async fn main() -> Result<()> {
     let (turn_tx, turn_rx) = watch::channel::<(usize, Vec<u8>)>((0, vec![]));
 
     // From client handler to coordinator
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<(u64, Command)>(128);
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<(u64, ServerCommand)>(128);
+
+    let server = Server { turn_tx, cmd_rx };
 
     // Server accept loop
     let handle = tokio::spawn(async move {
@@ -411,11 +426,16 @@ async fn main() -> Result<()> {
                         // TODO: Handle connection timeout
                         let conn = incoming_conn.await.unwrap();
                         debug!("Accepted cient from {}", conn.remote_address());
+                        // From coordinator to client handler
+                        let (client_tx, client_rx) =
+                            tokio::sync::mpsc::channel::<ClientCommand>(128);
                         let client = Client {
                             conn,
                             player_count: player_count.clone(),
                             turn_rx: turn_rx.clone(),
                             cmd_tx: cmd_tx.clone(),
+                            client_rx,
+                            client_tx,
                         };
                         client_set.spawn(client.run());
                     }
@@ -429,7 +449,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    let server = Server { turn_tx, cmd_rx };
     tokio::spawn(server.run());
 
     _ = handle.await?;
