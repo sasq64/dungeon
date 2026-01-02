@@ -8,6 +8,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
 use rustls_pemfile::{certs, private_key};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +25,39 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::fmt::FormatEvent;
+use tracing_subscriber::fmt::FormatFields;
+use tracing_subscriber::fmt::format;
+use tracing_subscriber::registry::LookupSpan;
 
+struct MyFormat;
+
+impl<S, N> FormatEvent<S, N> for MyFormat
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> fmt::Result {
+        let meta = event.metadata();
+
+        write!(&mut writer, "{} [{}]: ", meta.level(), meta.target())?;
+        if let Some(scope) = ctx.event_scope() {
+            for span in scope.from_root() {
+                write!(writer, "{}", span.name())?;
+            }
+        }
+
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        //ctx.format_fields(writer, event)?;
+        writeln!(writer)
+    }
+}
 fn load_certs(path: &Path) -> Vec<CertificateDer<'static>> {
     let mut reader = BufReader::new(File::open(path).unwrap());
     certs(&mut reader).map(|c| c.unwrap()).collect()
@@ -127,6 +160,7 @@ enum ServerCommand {
 enum ClientCommand {
     Packets(Vec<u8>),
     JoinGroup(u64, tokio::sync::watch::Receiver<(usize, Vec<u8>)>),
+    Turn(usize),
 }
 
 #[derive(Debug)]
@@ -135,6 +169,7 @@ struct Player {
     y: u32,
     moved: bool,
     sender: mpsc::Sender<ClientCommand>,
+    turn: usize,
 }
 
 struct GameState {
@@ -179,7 +214,9 @@ async fn read_packet(recv_stream: &mut quinn::RecvStream, target: &mut [u8]) -> 
     let mut t = [0u8; 2];
     recv_stream.read_exact(&mut t).await?;
     let len = u16::from_be_bytes(t) as usize;
+    trace!(target: "Client", "Got packet header: {} bytes", len);
     recv_stream.read_exact(&mut target[..len]).await?;
+    trace!(target: "Client", "Got packet");
     Ok(len)
 }
 
@@ -191,7 +228,7 @@ fn decode_packet(source: &[u8]) -> Result<Vec<i64>> {
         let val: i64 = rmp::decode::read_int(&mut cursor)?;
         result.push(val);
     }
-    debug!("Decoded packet {result:?}");
+    debug!(target: "Client", "Decoded packet {result:?}");
     Ok(result)
 }
 
@@ -199,11 +236,13 @@ fn decode_packet(source: &[u8]) -> Result<Vec<i64>> {
 struct Client {
     conn: Connection,
     player_count: Arc<AtomicU64>,
-    turn_rx: watch::Receiver<(usize, Vec<u8>)>,
+    turn_rx: Option<watch::Receiver<(usize, Vec<u8>)>>,
     cmd_tx: mpsc::Sender<(u64, ServerCommand)>,
     client_rx: mpsc::Receiver<ClientCommand>,
     client_tx: mpsc::Sender<ClientCommand>,
 }
+
+const CLIENT: &str = "Client";
 
 impl Client {
     async fn run(mut self) -> Result<()> {
@@ -217,40 +256,64 @@ impl Client {
 
         let buf = make_packet!(NetCmd::YouAre, id);
         send_stream.write(&buf).await?;
-        debug!(target = "client", "Player {id} loop starting");
+        debug!(target: "Client", "Player {id} loop starting");
         let mut connected = true;
 
-        while connected && self.turn_rx.changed().await.is_ok() {
-            trace!("Start loop");
-            while let Ok(cmd) = self.client_rx.try_recv() {
+        let mut turn = 0xffffffff;
+
+        while connected {
+            if let Some(ref mut turn_rx) = self.turn_rx {
+                trace!(target: CLIENT, "Wating for turn watch");
+                // turn_rx.changed().await?;
+                let (t, data) = turn_rx.borrow_and_update().clone();
+                turn = t;
+                if !data.is_empty() {
+                    trace!(target: CLIENT, "Sending turn data to peer");
+                    if send_stream.write_all(&data).await.is_err() {
+                        self.cmd_tx.send((id, ServerCommand::TimeoutPlayer)).await?;
+                        warn!(target: CLIENT, "Send failed");
+                        break;
+                    }
+                }
+            }
+
+            trace!(target: CLIENT, "Waiting for server commands");
+            let mut got_turn = false;
+            while !got_turn {
+                let cmd = self.client_rx.recv().await.unwrap();
+                trace!(target: CLIENT, "Command {cmd:?} from server");
                 match cmd {
                     ClientCommand::Packets(data) => {
+                        trace!(target: CLIENT, "Sending packet with {} bytes", data.len());
                         if !data.is_empty() && send_stream.write_all(&data).await.is_err() {
                             self.cmd_tx.send((id, ServerCommand::TimeoutPlayer)).await?;
-                            trace!("BREAK");
+                            warn!(target: CLIENT, "Send failed");
                             break;
                         }
                     }
                     ClientCommand::JoinGroup(_id, watch) => {
-                        self.turn_rx = watch;
+                        self.turn_rx = Some(watch);
+                    }
+                    ClientCommand::Turn(nt) => {
+                        turn = nt;
+                        got_turn = true;
                     }
                 }
             }
+            let buf = make_packet!(NetCmd::Turn, turn);
+            send_stream.write(&buf).await?;
+            turn += 1;
+
             if !connected {
-                trace!("BREAK");
+                warn!(target: CLIENT, "Send failed");
                 break;
             }
 
-            trace!(target = "client", "Read turn watch");
-            let (turn, data) = self.turn_rx.borrow_and_update().clone();
-            if !data.is_empty() && send_stream.write_all(&data).await.is_err() {
-                self.cmd_tx.send((id, ServerCommand::TimeoutPlayer)).await?;
-                trace!("BREAK");
-                break;
-            }
-            debug!("Player {id} turn {turn}");
+            self.cmd_tx.send((id, ServerCommand::Wait)).await?;
+
             let mut command: Option<ServerCommand> = None;
             while command.is_none() {
+                trace!(target: CLIENT, "Reading socket");
                 if let Ok(res) = timeout(
                     Duration::from_secs(600),
                     read_packet(&mut recv_stream, &mut target),
@@ -259,14 +322,14 @@ impl Client {
                 {
                     match res {
                         Ok(count) => {
-                            trace!("Read {:x?}", &target[0..count]);
+                            trace!(target: CLIENT, "Read {:x?}", &target[0..count]);
                             let packet = decode_packet(&target[..count])?;
                             if let Ok(cmd) = NetCmd::try_from(packet[0] as u8) {
                                 match cmd {
                                     NetCmd::MoveTo => {
                                         let x = packet[1] as u32;
                                         let y = packet[2] as u32;
-                                        trace!("Move To {x} {y}");
+                                        trace!(target: CLIENT, "Got packet MoveTo {x} {y}");
                                         command = Some(ServerCommand::MoveTo(x, y));
                                     }
                                     NetCmd::Pass => {
@@ -281,22 +344,23 @@ impl Client {
                             }
                         }
                         Err(e) => {
-                            warn!("Error: {:?}", e);
+                            warn!(target: CLIENT, "Error: {:?}", e);
                             command = Some(ServerCommand::TimeoutPlayer);
                             connected = false;
                         }
                     }
                 } else {
                     // Timeout
-                    warn!("Timeout");
+                    warn!(target: CLIENT, "Read timed out");
                     command = Some(ServerCommand::TimeoutPlayer);
                     connected = false;
                 }
             }
             if let Some(command) = command {
-                trace!("Client {id} command {command:?}");
+                trace!(target: CLIENT, "Client {id} produced command {command:?}");
                 self.cmd_tx.send((id, command)).await?;
                 if connected {
+                    trace!(target: CLIENT, "Client {id} Done (turn {turn})");
                     self.cmd_tx.send((id, ServerCommand::Done(turn))).await?;
                 }
             }
@@ -317,86 +381,108 @@ impl Server {
             players: HashMap::new(),
         };
 
-        let mut ids = HashSet::new();
-        let mut turn = 0;
-        //let mut out_data = Vec::<u8>::new();
+        //let mut ids = HashSet::new();
+        // let mut turn = 0;
+        //loop {
+        // debug!("Turn {turn} starting");
+        // let mut output = Vec::new();
+        // for (id, player) in &mut state.players {
+        //     if player.moved {
+        //         player.moved = false;
+        //         trace!("Player {id} moved");
+        //         make_packet_to!(&mut output, NetCmd::MoveTo, *id, player.x, player.y);
+        //     }
+        // }
+        // make_packet_to!(&mut output, NetCmd::Turn, turn);
+        // trace!("Send turn {turn}");
+        // self.turn_tx.send((turn, output)).unwrap();
+        // trace!("Send done");
+
+        // Get all client commands
         loop {
-            //if state.players.is_empty() {
-            //    tokio::time::sleep(Duration::from_millis(100)).await;
-            //} else {
-            debug!("Turn {turn} starting");
-            let mut output = Vec::new(); //out_data.clone();
-            //out_data.clear();
-            for (id, player) in &mut state.players {
-                if player.moved {
-                    player.moved = false;
-                    trace!("Player {id} moved");
-                    make_packet_to!(&mut output, NetCmd::MoveTo, *id, player.x, player.y);
-                }
-            }
-            make_packet_to!(&mut output, NetCmd::Turn, turn);
-            trace!("Send turn {turn}");
-            self.turn_tx.send((turn, output)).unwrap();
-            trace!("Send done");
-            //}
-            // Get all client commands
-            loop {
-                let (id, cmd) = self.cmd_rx.recv().await.unwrap();
-                debug!("Client {id} reported {:?}", cmd);
-                {
-                    match cmd {
-                        ServerCommand::AddPlayer(sender) => {
-                            let new_player = Player {
-                                x: 0,
-                                y: 0,
-                                moved: false,
-                                sender,
-                            };
-                            //let buf = make_packet!(NetCmd::PlayerJoin, id, 1, 0xffffff);
-                            //out_data.extend_from_slice(&buf);
-                            for (id, _player) in state.players.iter() {
-                                let _buf = make_packet!(NetCmd::PlayerJoin, *id, 1, 0xffffff);
-                                // TODO: Dont await on loop
-
-                                //new_player.sender.send(buf).await.unwrap();
-                            }
-                            _ = state.players.insert(id, new_player);
+            trace!("Reading client channel");
+            let (id, cmd) = self.cmd_rx.recv().await.unwrap();
+            trace!("Client {id} reported {:?}", cmd);
+            {
+                match cmd {
+                    ServerCommand::AddPlayer(sender) => {
+                        let new_player = Player {
+                            x: 0,
+                            y: 0,
+                            moved: false,
+                            sender,
+                            turn: 0,
+                        };
+                        //let buf = make_packet!(NetCmd::PlayerJoin, id, 1, 0xffffff);
+                        //out_data.extend_from_slice(&buf);
+                        for (id, _player) in state.players.iter() {
+                            let buf = make_packet!(NetCmd::PlayerJoin, *id, 1, 0xffffff);
+                            // TODO: Dont await on loop
+                            new_player
+                                .sender
+                                .send(ClientCommand::Packets(buf))
+                                .await
+                                .unwrap();
                         }
-                        ServerCommand::TimeoutPlayer => {
-                            _ = state.players.remove(&id);
-                            debug!("Removed player {id}");
-                        }
-                        ServerCommand::Done(done_turn) => {
-                            trace!("Done turn {done_turn}");
-                            assert!(done_turn == turn);
-                            ids.insert(id);
-                        }
-
-                        ServerCommand::MoveTo(x, y) => {
-                            let player = state.players.get_mut(&id).unwrap();
-                            player.x = x;
-                            player.y = y;
-                            player.moved = true;
-                        }
-                        _ => (),
+                        new_player
+                            .sender
+                            .send(ClientCommand::Turn(0))
+                            .await
+                            .unwrap();
+                        _ = state.players.insert(id, new_player);
                     }
-                }
-                trace!("{} {}", ids.len(), state.players.len());
-                if ids.len() >= state.players.len() {
-                    debug!("All clients done");
-                    // All clients have reported in
-                    turn += 1;
-                    ids.clear();
-                    break;
+                    ServerCommand::TimeoutPlayer => {
+                        _ = state.players.remove(&id);
+                        debug!("Removed player {id}");
+                    }
+                    ServerCommand::Done(done_turn) => {
+                        trace!("Done turn {done_turn}");
+                        //assert!(done_turn == turn);
+                        //ids.insert(id);
+                        let player = state.players.get_mut(&id).unwrap();
+                        player.turn += 1;
+                        player
+                            .sender
+                            .send(ClientCommand::Turn(player.turn))
+                            .await
+                            .unwrap();
+                    }
+
+                    ServerCommand::MoveTo(x, y) => {
+                        let player = state.players.get_mut(&id).unwrap();
+                        player.x = x;
+                        player.y = y;
+                        player.moved = true;
+                        let packet = make_packet!(NetCmd::MoveTo, id, player.x, player.y);
+                        for (id, player) in &mut state.players {
+                            trace!("Sending Move {x} {y} to cliend {id}");
+                            player
+                                .sender
+                                .send(ClientCommand::Packets(packet.clone()))
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    _ => (),
                 }
             }
+            // trace!("{} {}", ids.len(), state.players.len());
+            // if ids.len() >= state.players.len() {
+            //     debug!("All clients done");
+            //     // All clients have reported in
+            //     turn += 1;
+            //     ids.clear();
+            //     break;
+            // }
         }
+        //}
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        //.event_format(MyFormat)
         .with_target(true)
         .compact()
         .with_env_filter(EnvFilter::from_default_env())
@@ -412,8 +498,6 @@ async fn main() -> Result<()> {
 
     // From client handler to coordinator
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<(u64, ServerCommand)>(128);
-
-    let server = Server { turn_tx, cmd_rx };
 
     // Server accept loop
     let handle = tokio::spawn(async move {
@@ -432,7 +516,7 @@ async fn main() -> Result<()> {
                         let client = Client {
                             conn,
                             player_count: player_count.clone(),
-                            turn_rx: turn_rx.clone(),
+                            turn_rx: None,
                             cmd_tx: cmd_tx.clone(),
                             client_rx,
                             client_tx,
@@ -448,6 +532,8 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    let server = Server { turn_tx, cmd_rx };
 
     tokio::spawn(server.run());
 
