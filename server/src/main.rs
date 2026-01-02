@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Cursor};
+use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::{
@@ -153,14 +154,14 @@ enum ServerCommand {
     AddPlayer(mpsc::Sender<ClientCommand>),
     TimeoutPlayer,
     MoveTo(u32, u32),
-    Done(usize),
+    Done(i64),
 }
 
 #[derive(Debug)]
 enum ClientCommand {
     Packets(Vec<u8>),
     JoinGroup(u64, tokio::sync::watch::Receiver<(usize, Vec<u8>)>),
-    Turn(usize),
+    Turn(i64),
 }
 
 #[derive(Debug)]
@@ -169,7 +170,7 @@ struct Player {
     y: u32,
     moved: bool,
     sender: mpsc::Sender<ClientCommand>,
-    turn: usize,
+    turn: i64,
 }
 
 struct GameState {
@@ -210,7 +211,7 @@ macro_rules! make_packet_to {
     };
 }
 
-async fn read_packet(recv_stream: &mut quinn::RecvStream, target: &mut [u8]) -> Result<usize> {
+async fn read_packet_to(recv_stream: &mut quinn::RecvStream, target: &mut [u8]) -> Result<usize> {
     let mut t = [0u8; 2];
     recv_stream.read_exact(&mut t).await?;
     let len = u16::from_be_bytes(t) as usize;
@@ -218,6 +219,17 @@ async fn read_packet(recv_stream: &mut quinn::RecvStream, target: &mut [u8]) -> 
     recv_stream.read_exact(&mut target[..len]).await?;
     trace!(target: "Client", "Got packet");
     Ok(len)
+}
+
+async fn read_packet(recv_stream: &mut quinn::RecvStream) -> Result<Vec<u8>> {
+    let mut t = [0u8; 2];
+    recv_stream.read_exact(&mut t).await?;
+    let len = u16::from_be_bytes(t) as usize;
+    trace!(target: "Client", "Got packet header: {} bytes", len);
+    let mut target = vec![0; len];
+    recv_stream.read_exact(&mut target).await?;
+    trace!(target: "Client", "Got packet");
+    Ok(target)
 }
 
 fn decode_packet(source: &[u8]) -> Result<Vec<i64>> {
@@ -240,33 +252,72 @@ struct Client {
     cmd_tx: mpsc::Sender<(u64, ServerCommand)>,
     client_rx: mpsc::Receiver<ClientCommand>,
     client_tx: mpsc::Sender<ClientCommand>,
+    turn: i64,
 }
 
 const CLIENT: &str = "Client";
 
 impl Client {
+    fn handle_command(&mut self, cmd: ClientCommand) -> Option<Vec<u8>> {
+        trace!(target: CLIENT, "Command {cmd:?} from server");
+        match cmd {
+            ClientCommand::Packets(data) => {
+                trace!(target: CLIENT, "Sending packet with {} bytes", data.len());
+                if !data.is_empty() { Some(data) } else { None }
+                // if !data.is_empty() && send_stream.write_all(&data).await.is_err() {
+                //     self.cmd_tx.send((id, ServerCommand::TimeoutPlayer)).await?;
+                //     warn!(target: CLIENT, "Send failed");
+                // }
+            }
+            ClientCommand::JoinGroup(_id, watch) => {
+                self.turn_rx = Some(watch);
+                None
+            }
+            ClientCommand::Turn(nt) => {
+                self.turn = nt as i64;
+                //got_turn = true;
+                None
+            }
+        }
+    }
+
+    fn handle_socket(&mut self, data: &[u8]) -> Result<Option<ServerCommand>> {
+        trace!(target: CLIENT, "Read {:x?}", &data);
+        let packet = decode_packet(data)?;
+        let cmd = NetCmd::try_from(packet[0] as u8)?;
+        match cmd {
+            NetCmd::MoveTo => {
+                let x = packet[1] as u32;
+                let y = packet[2] as u32;
+                trace!(target: CLIENT, "Got packet MoveTo {x} {y}");
+                Ok(Some(ServerCommand::MoveTo(x, y)))
+            }
+            NetCmd::Pass => Ok(Some(ServerCommand::Wait)),
+            NetCmd::Turn => Ok(None),
+            _ => Ok(None),
+        }
+    }
+
     async fn run(mut self) -> Result<()> {
         //let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let (mut send_stream, mut recv_stream) = self.conn.open_bi().await?;
-        let mut target = vec![0; 128];
         let id = self.player_count.fetch_add(1, Ordering::SeqCst);
         self.cmd_tx
-            .send((id, ServerCommand::AddPlayer(self.client_tx)))
+            .send((id, ServerCommand::AddPlayer(self.client_tx.clone())))
             .await?;
 
         let buf = make_packet!(NetCmd::YouAre, id);
         send_stream.write(&buf).await?;
         debug!(target: "Client", "Player {id} loop starting");
+
         let mut connected = true;
 
-        let mut turn = 0xffffffff;
-
-        while connected {
+        loop {
             if let Some(ref mut turn_rx) = self.turn_rx {
                 trace!(target: CLIENT, "Wating for turn watch");
                 // turn_rx.changed().await?;
                 let (t, data) = turn_rx.borrow_and_update().clone();
-                turn = t;
+                self.turn = t as i64;
                 if !data.is_empty() {
                     trace!(target: CLIENT, "Sending turn data to peer");
                     if send_stream.write_all(&data).await.is_err() {
@@ -278,91 +329,46 @@ impl Client {
             }
 
             trace!(target: CLIENT, "Waiting for server commands");
-            let mut got_turn = false;
-            while !got_turn {
-                let cmd = self.client_rx.recv().await.unwrap();
-                trace!(target: CLIENT, "Command {cmd:?} from server");
-                match cmd {
-                    ClientCommand::Packets(data) => {
-                        trace!(target: CLIENT, "Sending packet with {} bytes", data.len());
-                        if !data.is_empty() && send_stream.write_all(&data).await.is_err() {
-                            self.cmd_tx.send((id, ServerCommand::TimeoutPlayer)).await?;
-                            warn!(target: CLIENT, "Send failed");
-                            break;
+            let mut command: Option<ServerCommand> = None;
+            {
+                let mut packet_future = pin!(read_packet(&mut recv_stream));
+                while command.is_none() {
+                    select! {
+                        cmd = self.client_rx.recv() => {
+                            if let Some(cmd) = cmd {
+                                if let Some(data) = self.handle_command(cmd) {
+                                    send_stream.write_all(&data).await.unwrap();
+                                }
+                            }
+                        },
+                        packet = &mut packet_future => {
+                            if let Ok(packet) = packet {
+                                if let Ok(cmd) = self.handle_socket(&packet) {
+                                    command = cmd;
+                                    trace!(target: CLIENT, "Client {id} produced command {command:?}");
+                                }
+                            }
                         }
-                    }
-                    ClientCommand::JoinGroup(_id, watch) => {
-                        self.turn_rx = Some(watch);
-                    }
-                    ClientCommand::Turn(nt) => {
-                        turn = nt;
-                        got_turn = true;
                     }
                 }
             }
-            let buf = make_packet!(NetCmd::Turn, turn);
+
+            let cmd = command.unwrap();
+            self.cmd_tx.send((id, cmd)).await?;
+            if connected {
+                trace!(target: CLIENT, "Client {id} Done (turn {})", self.turn);
+                self.cmd_tx
+                    .send((id, ServerCommand::Done(self.turn)))
+                    .await?;
+            }
+
+            let buf = make_packet!(NetCmd::Turn, self.turn);
             send_stream.write(&buf).await?;
-            turn += 1;
+            self.turn += 1;
 
             if !connected {
                 warn!(target: CLIENT, "Send failed");
                 break;
-            }
-
-            self.cmd_tx.send((id, ServerCommand::Wait)).await?;
-
-            let mut command: Option<ServerCommand> = None;
-            while command.is_none() {
-                trace!(target: CLIENT, "Reading socket");
-                if let Ok(res) = timeout(
-                    Duration::from_secs(600),
-                    read_packet(&mut recv_stream, &mut target),
-                )
-                .await
-                {
-                    match res {
-                        Ok(count) => {
-                            trace!(target: CLIENT, "Read {:x?}", &target[0..count]);
-                            let packet = decode_packet(&target[..count])?;
-                            if let Ok(cmd) = NetCmd::try_from(packet[0] as u8) {
-                                match cmd {
-                                    NetCmd::MoveTo => {
-                                        let x = packet[1] as u32;
-                                        let y = packet[2] as u32;
-                                        trace!(target: CLIENT, "Got packet MoveTo {x} {y}");
-                                        command = Some(ServerCommand::MoveTo(x, y));
-                                    }
-                                    NetCmd::Pass => {
-                                        command = Some(ServerCommand::Wait);
-                                    }
-                                    NetCmd::Turn => {}
-                                    _ => {}
-                                }
-                            } else {
-                                warn!("Illegal packet cmd from client {id}");
-                                connected = false;
-                            }
-                        }
-                        Err(e) => {
-                            warn!(target: CLIENT, "Error: {:?}", e);
-                            command = Some(ServerCommand::TimeoutPlayer);
-                            connected = false;
-                        }
-                    }
-                } else {
-                    // Timeout
-                    warn!(target: CLIENT, "Read timed out");
-                    command = Some(ServerCommand::TimeoutPlayer);
-                    connected = false;
-                }
-            }
-            if let Some(command) = command {
-                trace!(target: CLIENT, "Client {id} produced command {command:?}");
-                self.cmd_tx.send((id, command)).await?;
-                if connected {
-                    trace!(target: CLIENT, "Client {id} Done (turn {turn})");
-                    self.cmd_tx.send((id, ServerCommand::Done(turn))).await?;
-                }
             }
         }
         debug!("Client {id} exit loop");
@@ -520,6 +526,7 @@ async fn main() -> Result<()> {
                             cmd_tx: cmd_tx.clone(),
                             client_rx,
                             client_tx,
+                            turn: -1
                         };
                         client_set.spawn(client.run());
                     }
