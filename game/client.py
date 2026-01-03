@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Callable, cast
 
 import msgpack
 from aioquic.asyncio.client import connect
@@ -31,6 +31,8 @@ Turn = 2
 MoveTo = 3
 PlayerJoin = 4
 PlayerLeave = 5
+LevelInfo = 6
+AddTile = 7
 
 
 @dataclass
@@ -70,6 +72,8 @@ class Client:
         self.writer: StreamWriter | None = None
         self.turn: int | None = None
         self.players: dict[int, Player] = {}
+        self.seed = 0
+        self.set_tile: Callable[[int, int, int], None] | None
 
     def get_moved(self) -> tuple[int, int] | None:
         res = self.moved_to
@@ -87,6 +91,7 @@ class Client:
                 (sz,) = struct.unpack(">H", data)
                 data = await reader.readexactly(sz)
                 msg = msgpack.unpackb(data)
+                print(f"PACKET {msg}")
                 if msg[0] == YouAre:
                     self.id = msg[1]
                     log(f"I AM {self.id}")
@@ -100,6 +105,13 @@ class Client:
                     id, tile, color = msg[1:]
                     log(f"JOIN {id} {tile} {color}")
                     self.players[id] = Player(id, -1, -1, tile, color)
+                elif msg[0] == LevelInfo:
+                    self.seed = msg[1]
+                    print(f"Seed is {self.seed}")
+                elif msg[0] == AddTile:
+                    x, y, tile = msg[1:]
+                    if self.set_tile:
+                        self.set_tile(x, y, tile)
 
                 elif msg[0] == MoveTo:
                     id, x, y = msg[1:]
@@ -109,6 +121,7 @@ class Client:
                         p = self.players[id]
                         p.x = x
                         p.y = y
+                        log(f"Player #{id} moved to {x} {y}")
                     else:
                         log(f"Unknown player {id} moved")
 
@@ -150,6 +163,11 @@ class Client:
         if self.connection:
             await self.connection.__aexit__(None, None, None)
             self.connection = None
+
+    async def get_seed(self) -> int:
+        while self.seed == 0:
+            await asyncio.sleep(0.1)
+        return self.seed
 
     async def connect(self):
         logger.info("Connecting to 127.0.0.1:5000...")

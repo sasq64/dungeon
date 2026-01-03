@@ -13,7 +13,7 @@ from generate import Map
 
 
 class Game:
-    def __init__(self, client: Client, screen: pix.Canvas):
+    def __init__(self, client: Client, screen: pix.Canvas, seed: int = 0):
         self.screen = screen
         sprite_path = Path("gfx/Characters")
         self.sprites = pix.load_png(
@@ -36,6 +36,8 @@ class Game:
         # con.set_tiles([ord('#')] * 128 * 128)
 
         self.seed = time.time_ns()
+        if seed != 0:
+            self.seed = seed
         # seed = 1766348969638435230
         # seed = 1766260133058949000
         random.seed(self.seed)
@@ -77,7 +79,7 @@ class Game:
         # self.next_time = pix.get_seconds() + self.interval
         self.delta = pix.Float2.ZERO
         self.moving = 0
-        self.waiting_turn = False
+        self.waiting_turn = True
         self.current_turn = -1
 
     def update(self):
@@ -97,11 +99,11 @@ class Game:
                     p0 = pix.Float2(r2.rects[0].x, r2.rects[0].y) * self.tile_size
                     self.screen.rect(p0, size=(32, 32))
 
-        new_turn = self.client.get_new_turn()
-        if new_turn is not None:
-            print(f"New turn {new_turn}")
-            self.current_turn = new_turn
-            self.waiting_turn = True
+        # new_turn = self.client.get_new_turn()
+        # if new_turn is not None:
+        #     print(f"New turn {new_turn}")
+        #     self.current_turn = new_turn
+        #     self.waiting_turn = True
         if self.waiting_turn:
             target = self.pos
             if pix.was_pressed(pix.key.LEFT):
@@ -124,6 +126,7 @@ class Game:
             print("Moved OK")
             self.pos = pix.Float2(new_pos[0], new_pos[1])
             self.target = self.pos
+            self.waiting_turn = True
 
         arrows = 10 * 32 + 17
 
@@ -139,7 +142,7 @@ class Game:
             if player.id == self.client.id:
                 continue
             if player.x >= 0:
-                tile = self.tiles[player.tile]
+                tile = self.tiles[1]  # player.tile]
                 pos = pix.Float2(player.x, player.y) * self.tile_size
                 self.screen.draw(image=tile, top_left=pos, size=tile.size)
 
@@ -152,9 +155,10 @@ class Game:
 async def main():
     client = Client()
     await client.connect()
+    seed = await client.get_seed()
     screen = pix.open_display(size=(1280, 1024), full_screen=False, id="dungeon")
 
-    game = Game(client, screen)
+    game = Game(client, screen, seed=seed)
 
     while pix.run_loop():
         screen.clear(0xFF0000FF)

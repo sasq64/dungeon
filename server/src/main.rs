@@ -1,4 +1,5 @@
 use anyhow::Result;
+use futures::future::join_all;
 use num_enum::IntoPrimitive;
 use num_enum::TryFromPrimitive;
 use quinn::Connection;
@@ -7,8 +8,8 @@ use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
 use rustls_pemfile::{certs, private_key};
-use std::collections::{HashMap, HashSet};
-use std::fmt;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::pin::pin;
@@ -23,42 +24,12 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::fmt::FmtContext;
-use tracing_subscriber::fmt::FormatEvent;
-use tracing_subscriber::fmt::FormatFields;
-use tracing_subscriber::fmt::format;
-use tracing_subscriber::registry::LookupSpan;
 
-struct MyFormat;
+mod vec2;
+use vec2::Vec2;
 
-impl<S, N> FormatEvent<S, N> for MyFormat
-where
-    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
-    N: for<'a> FormatFields<'a> + 'static,
-{
-    fn format_event(
-        &self,
-        ctx: &FmtContext<'_, S, N>,
-        mut writer: format::Writer<'_>,
-        event: &tracing::Event<'_>,
-    ) -> fmt::Result {
-        let meta = event.metadata();
-
-        write!(&mut writer, "{} [{}]: ", meta.level(), meta.target())?;
-        if let Some(scope) = ctx.event_scope() {
-            for span in scope.from_root() {
-                write!(writer, "{}", span.name())?;
-            }
-        }
-
-        ctx.field_format().format_fields(writer.by_ref(), event)?;
-        //ctx.format_fields(writer, event)?;
-        writeln!(writer)
-    }
-}
 fn load_certs(path: &Path) -> Vec<CertificateDer<'static>> {
     let mut reader = BufReader::new(File::open(path).unwrap());
     certs(&mut reader).map(|c| c.unwrap()).collect()
@@ -146,6 +117,8 @@ enum NetCmd {
     MoveTo = 3,
     PlayerJoin = 4,
     PlayerLeave = 5,
+    LevelInfo = 6,
+    PlaceTile = 7,
 }
 
 #[derive(Debug)]
@@ -166,15 +139,16 @@ enum ClientCommand {
 
 #[derive(Debug)]
 struct Player {
-    x: u32,
-    y: u32,
+    pos: Vec2<i32>,
     moved: bool,
     sender: mpsc::Sender<ClientCommand>,
     turn: i64,
+    group: Option<u64>,
 }
 
 struct GameState {
     players: HashMap<u64, Player>,
+    groups: HashMap<u64, CombatGroup>,
 }
 
 /// Create a framed msgpack packet
@@ -269,7 +243,8 @@ impl Client {
                 //     warn!(target: CLIENT, "Send failed");
                 // }
             }
-            ClientCommand::JoinGroup(_id, watch) => {
+            ClientCommand::JoinGroup(id, watch) => {
+                trace!(target: CLIENT, "Joined group {id}");
                 self.turn_rx = Some(watch);
                 None
             }
@@ -313,28 +288,29 @@ impl Client {
         let mut connected = true;
 
         loop {
-            if let Some(ref mut turn_rx) = self.turn_rx {
-                trace!(target: CLIENT, "Wating for turn watch");
-                // turn_rx.changed().await?;
-                let (t, data) = turn_rx.borrow_and_update().clone();
-                self.turn = t as i64;
-                if !data.is_empty() {
-                    trace!(target: CLIENT, "Sending turn data to peer");
-                    if send_stream.write_all(&data).await.is_err() {
-                        self.cmd_tx.send((id, ServerCommand::TimeoutPlayer)).await?;
-                        warn!(target: CLIENT, "Send failed");
-                        break;
-                    }
-                }
-            }
+            // if let Some(ref mut turn_rx) = self.turn_rx {
+            //     trace!(target: CLIENT, "Wating for turn watch");
+            //     // turn_rx.changed().await?;
+            //     let (t, data) = turn_rx.borrow_and_update().clone();
+            //     self.turn = t as i64;
+            //     if !data.is_empty() {
+            //         trace!(target: CLIENT, "Sending turn data to peer");
+            //         if send_stream.write_all(&data).await.is_err() {
+            //             self.cmd_tx.send((id, ServerCommand::TimeoutPlayer)).await?;
+            //             warn!(target: CLIENT, "Send failed");
+            //             break;
+            //         }
+            //     }
+            // }
 
             trace!(target: CLIENT, "Waiting for server commands");
             let mut command: Option<ServerCommand> = None;
             {
                 let mut packet_future = pin!(read_packet(&mut recv_stream));
-                while command.is_none() {
+                loop {
                     select! {
                         cmd = self.client_rx.recv() => {
+                            trace!(target: CLIENT, "Got server command");
                             if let Some(cmd) = cmd {
                                 if let Some(data) = self.handle_command(cmd) {
                                     send_stream.write_all(&data).await.unwrap();
@@ -342,38 +318,50 @@ impl Client {
                             }
                         },
                         packet = &mut packet_future => {
+                            trace!(target: CLIENT, "Got full packet");
                             if let Ok(packet) = packet {
                                 if let Ok(cmd) = self.handle_socket(&packet) {
                                     command = cmd;
                                     trace!(target: CLIENT, "Client {id} produced command {command:?}");
                                 }
+                            } else {
+                                connected = false;
                             }
+                            break;
                         }
                     }
                 }
             }
-
-            let cmd = command.unwrap();
-            self.cmd_tx.send((id, cmd)).await?;
-            if connected {
-                trace!(target: CLIENT, "Client {id} Done (turn {})", self.turn);
-                self.cmd_tx
-                    .send((id, ServerCommand::Done(self.turn)))
-                    .await?;
-            }
-
-            let buf = make_packet!(NetCmd::Turn, self.turn);
-            send_stream.write(&buf).await?;
-            self.turn += 1;
-
             if !connected {
-                warn!(target: CLIENT, "Send failed");
+                self.cmd_tx.send((id, ServerCommand::TimeoutPlayer)).await?;
                 break;
             }
+
+            if let Some(cmd) = command {
+                self.cmd_tx.send((id, cmd)).await?;
+            }
+
+            // trace!(target: CLIENT, "Client {id} Done (turn {})", self.turn);
+            // self.cmd_tx
+            //     .send((id, ServerCommand::Done(self.turn)))
+            //     .await?;
+            // let buf = make_packet!(NetCmd::Turn, self.turn);
+            // send_stream.write(&buf).await?;
+            // self.turn += 1;
+            //
+            // if !connected {
+            //     warn!(target: CLIENT, "Send failed");
+            //     break;
+            // }
         }
         debug!("Client {id} exit loop");
         Ok(())
     }
+}
+
+struct CombatGroup {
+    members: HashSet<u64>,
+    turn_tx: tokio::sync::watch::Sender<(usize, Vec<u8>)>,
 }
 
 struct Server {
@@ -385,67 +373,61 @@ impl Server {
     async fn run(mut self) -> Result<()> {
         let mut state = GameState {
             players: HashMap::new(),
+            groups: HashMap::new(),
         };
 
-        //let mut ids = HashSet::new();
-        // let mut turn = 0;
-        //loop {
-        // debug!("Turn {turn} starting");
-        // let mut output = Vec::new();
-        // for (id, player) in &mut state.players {
-        //     if player.moved {
-        //         player.moved = false;
-        //         trace!("Player {id} moved");
-        //         make_packet_to!(&mut output, NetCmd::MoveTo, *id, player.x, player.y);
-        //     }
-        // }
-        // make_packet_to!(&mut output, NetCmd::Turn, turn);
-        // trace!("Send turn {turn}");
-        // self.turn_tx.send((turn, output)).unwrap();
-        // trace!("Send done");
+        let (turn_tx, turn_rx) = watch::channel::<(usize, Vec<u8>)>((0, vec![]));
+        let turn_group = CombatGroup {
+            members: HashSet::new(),
+            turn_tx,
+        };
 
-        // Get all client commands
         loop {
             trace!("Reading client channel");
-            let (id, cmd) = self.cmd_rx.recv().await.unwrap();
-            trace!("Client {id} reported {:?}", cmd);
+            let (from_id, cmd) = self.cmd_rx.recv().await.unwrap();
+            trace!("Client {from_id} reported {:?}", cmd);
             {
                 match cmd {
                     ServerCommand::AddPlayer(sender) => {
                         let new_player = Player {
-                            x: 0,
-                            y: 0,
+                            pos: Vec2::<i32> { x: 0, y: 0 },
                             moved: false,
                             sender,
                             turn: 0,
+                            group: None,
                         };
-                        //let buf = make_packet!(NetCmd::PlayerJoin, id, 1, 0xffffff);
-                        //out_data.extend_from_slice(&buf);
+
+                        let mut packets = Vec::new();
+                        let seed: u64 = 1767444506747788338;
+                        make_packet_to!(&mut packets, NetCmd::LevelInfo, seed);
                         for (id, _player) in state.players.iter() {
-                            let buf = make_packet!(NetCmd::PlayerJoin, *id, 1, 0xffffff);
-                            // TODO: Dont await on loop
-                            new_player
-                                .sender
-                                .send(ClientCommand::Packets(buf))
-                                .await
-                                .unwrap();
+                            make_packet_to!(&mut packets, NetCmd::PlayerJoin, *id, 0, 0xffffff);
                         }
                         new_player
                             .sender
-                            .send(ClientCommand::Turn(0))
-                            .await
-                            .unwrap();
-                        _ = state.players.insert(id, new_player);
+                            .send(ClientCommand::Packets(packets))
+                            .await?;
+
+                        // let futures = state.players.iter().map(|(id, player)| {
+                        //     new_player.sender.send(ClientCommand::Packets(make_packet!(
+                        //         NetCmd::PlayerJoin,
+                        //         *id,
+                        //         player.turn, // TODO: Add tile instead
+                        //         0xffffff
+                        //     )))
+                        // });
+                        // _ = join_all(futures).await;
+                        _ = state.players.insert(from_id, new_player);
                     }
                     ServerCommand::TimeoutPlayer => {
-                        _ = state.players.remove(&id);
-                        debug!("Removed player {id}");
+                        _ = state.players.remove(&from_id);
+                        debug!("Removed player {from_id}");
                     }
                     ServerCommand::Done(done_turn) => {
                         trace!("Done turn {done_turn}");
                         //assert!(done_turn == turn);
                         //ids.insert(id);
-                        let player = state.players.get_mut(&id).unwrap();
+                        let player = state.players.get_mut(&from_id).unwrap();
                         player.turn += 1;
                         player
                             .sender
@@ -455,33 +437,51 @@ impl Server {
                     }
 
                     ServerCommand::MoveTo(x, y) => {
-                        let player = state.players.get_mut(&id).unwrap();
-                        player.x = x;
-                        player.y = y;
-                        player.moved = true;
-                        let packet = make_packet!(NetCmd::MoveTo, id, player.x, player.y);
-                        for (id, player) in &mut state.players {
-                            trace!("Sending Move {x} {y} to cliend {id}");
+                        let moving_player = state.players.get_mut(&from_id).unwrap();
+                        moving_player.pos = Vec2::<i32> {
+                            x: x as i32,
+                            y: y as i32,
+                        };
+                        moving_player.moved = true;
+                        let packet = make_packet!(NetCmd::MoveTo, from_id, x, y);
+                        let pos = moving_player.pos;
+
+                        let mut members = HashSet::<u64>::new();
+
+                        for (xid, player) in &mut state.players.iter_mut() {
+                            if from_id != *xid {
+                                let d = (player.pos - pos).mag();
+                                if d < 3.0 {
+                                    debug!("Players are nearby!");
+                                    if player.group.is_none() {
+                                        debug!("Adding to group!");
+                                        members.insert(*xid);
+                                    }
+                                }
+                            }
+                            trace!("Sending Move {x} {y} to cliend {xid}");
                             player
                                 .sender
                                 .send(ClientCommand::Packets(packet.clone()))
                                 .await
                                 .unwrap();
                         }
+                        if !members.is_empty() {
+                            for id in members {
+                                let player = state.players.get_mut(&id).unwrap();
+                                player.group = Some(0);
+                                player
+                                    .sender
+                                    .send(ClientCommand::JoinGroup(0, turn_rx.clone()))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
                     }
                     _ => (),
                 }
             }
-            // trace!("{} {}", ids.len(), state.players.len());
-            // if ids.len() >= state.players.len() {
-            //     debug!("All clients done");
-            //     // All clients have reported in
-            //     turn += 1;
-            //     ids.clear();
-            //     break;
-            // }
         }
-        //}
     }
 }
 
