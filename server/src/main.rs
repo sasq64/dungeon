@@ -1,5 +1,6 @@
+#![allow(dead_code)]
+
 use anyhow::Result;
-use futures::future::join_all;
 use num_enum::IntoPrimitive;
 use num_enum::TryFromPrimitive;
 use quinn::Connection;
@@ -24,11 +25,16 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 use tracing_subscriber::EnvFilter;
 
 mod vec2;
 use vec2::Vec2;
+const TILE_MONSTERS: u32 = 13 * 32;
+const TILE_SKELETON: u32 = TILE_MONSTERS + 2 * 32 + 5;
+const TILE_WALL: u32 = 2 + 32;
+const TILE_WARRIOR: u32 = TILE_MONSTERS + 1;
+const TILE_KNIGHT: u32 = TILE_MONSTERS + 32 + 8;
 
 fn load_certs(path: &Path) -> Vec<CertificateDer<'static>> {
     let mut reader = BufReader::new(File::open(path).unwrap());
@@ -143,6 +149,8 @@ struct Player {
     moved: bool,
     sender: mpsc::Sender<ClientCommand>,
     turn: i64,
+    tile: u32,
+    color: u32,
     group: Option<u64>,
 }
 
@@ -377,7 +385,7 @@ impl Server {
         };
 
         let (turn_tx, turn_rx) = watch::channel::<(usize, Vec<u8>)>((0, vec![]));
-        let turn_group = CombatGroup {
+        let mut turn_group = CombatGroup {
             members: HashSet::new(),
             turn_tx,
         };
@@ -394,15 +402,39 @@ impl Server {
                             moved: false,
                             sender,
                             turn: 0,
+                            tile: TILE_KNIGHT,
+                            color: 0xff0000ff,
                             group: None,
                         };
 
                         let mut packets = Vec::new();
                         let seed: u64 = 1767444506747788338;
                         make_packet_to!(&mut packets, NetCmd::LevelInfo, seed);
-                        for (id, _player) in state.players.iter() {
-                            make_packet_to!(&mut packets, NetCmd::PlayerJoin, *id, 0, 0xffffff);
+                        for (id, player) in state.players.iter() {
+                            make_packet_to!(
+                                &mut packets,
+                                NetCmd::PlayerJoin,
+                                *id,
+                                player.tile,
+                                player.color,
+                                player.pos.x,
+                                player.pos.y
+                            );
+
+                            player
+                                .sender
+                                .send(ClientCommand::Packets(make_packet!(
+                                    NetCmd::PlayerJoin,
+                                    from_id,
+                                    new_player.tile,
+                                    new_player.color,
+                                    new_player.pos.x,
+                                    new_player.pos.y
+                                )))
+                                .await?;
                         }
+                        make_packet_to!(&mut packets, NetCmd::PlaceTile, 10, 10, TILE_SKELETON);
+                        make_packet_to!(&mut packets, NetCmd::PlaceTile, 25, 25, TILE_SKELETON);
                         new_player
                             .sender
                             .send(ClientCommand::Packets(packets))
@@ -448,17 +480,16 @@ impl Server {
 
                         let mut members = HashSet::<u64>::new();
 
-                        for (xid, player) in &mut state.players.iter_mut() {
-                            if from_id != *xid {
-                                let d = (player.pos - pos).mag();
-                                if d < 3.0 {
-                                    debug!("Players are nearby!");
-                                    if player.group.is_none() {
-                                        debug!("Adding to group!");
-                                        members.insert(*xid);
-                                    }
-                                }
+                        let d = (Vec2::<i32> { x: 10, y: 10 } - pos).mag();
+                        if d < 3.0 {
+                            debug!("Monster nearby!");
+                            if moving_player.group.is_none() {
+                                debug!("Adding to group!");
+                                members.insert(from_id);
                             }
+                        }
+
+                        for (xid, player) in &mut state.players.iter_mut() {
                             trace!("Sending Move {x} {y} to cliend {xid}");
                             player
                                 .sender
@@ -469,6 +500,7 @@ impl Server {
                         if !members.is_empty() {
                             for id in members {
                                 let player = state.players.get_mut(&id).unwrap();
+                                turn_group.members.insert(id);
                                 player.group = Some(0);
                                 player
                                     .sender

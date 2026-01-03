@@ -73,12 +73,20 @@ class Client:
         self.turn: int | None = None
         self.players: dict[int, Player] = {}
         self.seed = 0
-        self.set_tile: Callable[[int, int, int], None] | None
+        self.set_tile: Callable[[int, int, int], None] | None = None
+        self.tiles: list[tuple[int, int, int]] = []
 
     def get_moved(self) -> tuple[int, int] | None:
         res = self.moved_to
         self.moved_to = None
         return res
+
+    def flush_tiles(self):
+        if self.set_tile:
+            for x, y, tile in self.tiles:
+                print(f"SET TILE {x} {y}")
+                self.set_tile(x, y, tile)
+            self.tiles = []
 
     async def handle(self, reader: StreamReader, writer: StreamWriter):
         self.writer = writer
@@ -102,21 +110,25 @@ class Client:
                     self.turn = turn
                     self.turn_event.set()
                 elif msg[0] == PlayerJoin:
-                    id, tile, color = msg[1:]
+                    id, tile, color, x, y = msg[1:]
                     log(f"JOIN {id} {tile} {color}")
-                    self.players[id] = Player(id, -1, -1, tile, color)
+                    self.players[id] = Player(id, x, y, tile, color)
                 elif msg[0] == LevelInfo:
                     self.seed = msg[1]
                     print(f"Seed is {self.seed}")
                 elif msg[0] == AddTile:
                     x, y, tile = msg[1:]
+                    print(self.set_tile)
                     if self.set_tile:
                         self.set_tile(x, y, tile)
+                    else:
+                        print("APPEND")
+                        self.tiles.append((x, y, tile))
 
                 elif msg[0] == MoveTo:
                     id, x, y = msg[1:]
                     if not id in self.players:
-                        self.players[id] = Player(id, -1, -1, 1, 0xFFFFFF)
+                        self.players[id] = Player(id, -1, -1, 32 * 13 + 1, 0xFFFFFF)
                     if id in self.players:
                         p = self.players[id]
                         p.x = x

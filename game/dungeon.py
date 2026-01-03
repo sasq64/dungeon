@@ -13,14 +13,12 @@ from generate import Map
 
 
 class Game:
-    def __init__(self, client: Client, screen: pix.Canvas, seed: int = 0):
+    def __init__(self, screen: pix.Canvas):
         self.screen = screen
         sprite_path = Path("gfx/Characters")
         self.sprites = pix.load_png(
             sprite_path / "Soldier/Soldier/Soldier-Walk.png"
         ).split(cols=8, rows=1)
-
-        self.client = client
 
         # s = 32.0
         self.tile_size = pix.Float2(16, 16)
@@ -35,19 +33,24 @@ class Game:
 
         # con.set_tiles([ord('#')] * 128 * 128)
 
-        self.seed = time.time_ns()
-        if seed != 0:
-            self.seed = seed
+        self.interval = 0.2
+
+        self.pos = pix.Float2(1, 1)
+        self.target = self.pos
+
+        # self.next_time = pix.get_seconds() + self.interval
+        self.delta = pix.Float2.ZERO
+        self.moving = 0
+        self.waiting_turn = True
+        self.current_turn = -1
+        self.seed = 0
+
+    def populate(self):
         # seed = 1766348969638435230
         # seed = 1766260133058949000
         random.seed(self.seed)
-
         size = pix.Int2(120, 75)
         self.map = Map(size)
-
-        print(self.seed)
-        # map.join_rooms()
-
         for p in self.con.grid_size.grid_coordinates():
             self.con.put(p, 1024 + 3 * 32)
 
@@ -69,18 +72,16 @@ class Game:
                 self.con.put((r.x, r.y), 0x30 + t // 10)
                 self.con.put((r.x + 1, r.y), 0x30 + t % 10)
 
-        self.interval = 0.2
+    def set_tile(self, x: int, y: int, tile: int):
+        self.con.put((x, y), tile + 1024)
 
-        self.xy = self.map.rooms[9].rects[0].center
-        self.pos = self.xy.tof()
-        self.pos = pix.Float2(1, 1)
-        self.target = self.pos
-
-        # self.next_time = pix.get_seconds() + self.interval
-        self.delta = pix.Float2.ZERO
-        self.moving = 0
-        self.waiting_turn = True
-        self.current_turn = -1
+    def set_client(self, client: Client, seed: int):
+        self.client = client
+        self.seed = seed
+        self.populate()
+        print("SETTING set_tile")
+        client.set_tile = self.set_tile
+        client.flush_tiles()
 
     def update(self):
         self.screen.draw(self.con, size=self.con.size)
@@ -142,9 +143,11 @@ class Game:
             if player.id == self.client.id:
                 continue
             if player.x >= 0:
-                tile = self.tiles[1]  # player.tile]
+                tile = self.tiles[player.tile]  # player.tile]
                 pos = pix.Float2(player.x, player.y) * self.tile_size
+                self.screen.draw_color = player.color
                 self.screen.draw(image=tile, top_left=pos, size=tile.size)
+                self.screen.draw_color = pix.color.WHITE
 
         pos = (self.pos * self.tile_size) - (40, 40)
         frame = (pos.x / 10) % 8
@@ -155,10 +158,11 @@ class Game:
 async def main():
     client = Client()
     await client.connect()
-    seed = await client.get_seed()
     screen = pix.open_display(size=(1280, 1024), full_screen=False, id="dungeon")
 
-    game = Game(client, screen, seed=seed)
+    game = Game(screen)
+    seed = await client.get_seed()
+    game.set_client(client, seed)
 
     while pix.run_loop():
         screen.clear(0xFF0000FF)
